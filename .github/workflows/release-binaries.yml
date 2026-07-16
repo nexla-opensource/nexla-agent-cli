@@ -1,0 +1,178 @@
+name: Release (binaries + npm)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: nexla-linux-x64
+          - os: macos-latest
+            asset: nexla-macos-arm64
+          - os: windows-latest
+            asset: nexla-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install . pyinstaller
+      - name: Build (bundling SKILL.md/AGENTS.md + skill_pack/ so `nexla-cli skill install` works from the binary too)
+        shell: python
+        run: |
+          import os
+          import PyInstaller.__main__
+
+          def add_data(src: str, dest: str) -> str:
+              # PyInstaller's --add-data separator is OS-specific (":" on
+              # posix, ";" on Windows) -- os.pathsep gets this right without
+              # needing per-OS shell branches in this matrix job.
+              return f"src/nexla_cli/{src}{os.pathsep}{dest}"
+
+          PyInstaller.__main__.run([
+              "--onefile",
+              "--name", "${{ matrix.asset }}",
+              "--add-data", add_data("SKILL.md", "nexla_cli"),
+              "--add-data", add_data("AGENTS.md", "nexla_cli"),
+              # Whole vendored domain pack (reference/ + examples/ +
+              # VENDORED_FROM.md), preserving the subdir layout under
+              # nexla_cli/skill_pack so `skill install`'s resource
+              # traversal finds it from the compiled binary too.
+              "--add-data", add_data("skill_pack", "nexla_cli/skill_pack"),
+              "scripts/pyinstaller_entry.py",
+          ])
+      # Assert the runner's architecture matches the asset we're about to
+      # publish under that name -- macos-latest is Apple Silicon (arm64),
+      # ubuntu-latest is x86_64. A drift here (e.g. GitHub flipping a
+      # runner image) would otherwise ship a mislabeled binary that
+      # install.js hands to the wrong machine.
+      - name: Assert runner architecture matches asset (posix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          arch="$(uname -m)"
+          case "${{ matrix.asset }}" in
+            nexla-macos-arm64)
+              [ "$arch" = "arm64" ] || { echo "expected arm64, got $arch"; exit 1; } ;;
+            nexla-linux-x64)
+              [ "$arch" = "x86_64" ] || { echo "expected x86_64, got $arch"; exit 1; } ;;
+            *)
+              echo "unexpected posix asset ${{ matrix.asset }}"; exit 1 ;;
+          esac
+          echo "arch OK: $arch for ${{ matrix.asset }}"
+      - name: Assert runner architecture matches asset (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          if ($arch -ne "AMD64") {
+            Write-Error "expected AMD64, got $arch"; exit 1
+          }
+          Write-Output "arch OK: $arch for ${{ matrix.asset }}"
+      # Smoke-test the freshly built binary before it can be uploaded:
+      # run it with --help and require exit 0 plus a usage banner. Catches
+      # a binary that built but can't actually start (missing bundled
+      # data, broken entrypoint, etc.) at release time, not on a user's
+      # machine.
+      - name: Smoke-test binary (--help, posix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          chmod +x "dist/${{ matrix.asset }}"
+          out="$("dist/${{ matrix.asset }}" --help)"
+          echo "$out"
+          echo "$out" | grep -Eqi "usage" || { echo "no usage banner in --help"; exit 1; }
+      - name: Smoke-test binary (--help, windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = & "dist/${{ matrix.asset }}" --help
+          $out | Write-Output
+          if ($LASTEXITCODE -ne 0) { Write-Error "--help exited $LASTEXITCODE"; exit 1 }
+          if (-not ($out -match "(?i)usage")) { Write-Error "no usage banner in --help"; exit 1 }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      # Publish a SHA256SUMS manifest alongside the binaries. install.js
+      # fetches this from the same release and verifies each downloaded
+      # asset against it (and gracefully skips verification for older
+      # releases that predate this manifest).
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: shasum -a 256 * > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: dist/*
+
+  publish-npm:
+    # `needs: release` (not just `needs: build`) is load-bearing: the npm
+    # package's postinstall downloads these exact binaries from the
+    # GitHub release, so publishing to npm before the release job has
+    # actually attached them would give anyone who installs in that
+    # window a broken postinstall. A separate, independently-triggered
+    # publish-npm.yml (mirroring publish-pypi.yml) can't express this
+    # ordering across workflow files without workflow_run complexity -
+    # a job in the same workflow with a plain `needs:` is simpler.
+    needs: release
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read # checkout needs read access (private repo); job perms replace top-level
+      id-token: write # required for npm Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      # npm Trusted Publishing needs npm >=11.5.1; Node 22's bundled npm
+      # can lag behind that, so pin it explicitly rather than trust
+      # whatever setup-node happens to ship.
+      - run: npm install -g npm@latest && npm --version
+
+      # Trusted Publishing (OIDC). Requires a one-time setup on npmjs.com,
+      # done by the repo owner (not automatable from a workflow run):
+      # package "nexla-cli" -> Settings -> Trusted Publisher -> add:
+      #   Organization or user: this repo's GitHub org/user
+      #   Repository: this repo's name
+      #   Workflow filename: release-binaries.yml (filename only, not the
+      #     path - and note this is the *workflow* filename, not this job)
+      #   Environment name: npm (matches the `environment:` key above)
+      #   Allowed actions: npm publish
+      # No secret/token needed once that's configured -- id-token: write
+      # is the only permission npm's OIDC handshake requires. Provenance
+      # attestations are generated automatically; no --provenance flag
+      # needed.
+      - run: npm publish --access public
+        working-directory: npm
+
+      # Optional fallback if Trusted Publishing isn't set up yet: uncomment
+      # and set an NPM_TOKEN repo secret instead of relying on OIDC.
+      # Not used by default.
+      # - run: npm publish --access public
+      #   working-directory: npm
+      #   env:
+      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

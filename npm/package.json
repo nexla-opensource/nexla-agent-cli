@@ -1,0 +1,33 @@
+{
+  "name": "@nexla/nexla-cli",
+  "version": "0.3.0",
+  "description": "Command-line client for the Nexla agent API (native binary, no Python required)",
+  "author": "Nexla, Inc.",
+  "keywords": [
+    "nexla",
+    "cli",
+    "data-integration",
+    "etl",
+    "agent"
+  ],
+  "bin": {
+    "nexla-cli": "bin/nexla.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/install.js",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nexla-opensource/nexla-agent-cli.git"
+  },
+  "homepage": "https://github.com/nexla-opensource/nexla-agent-cli#readme",
+  "bugs": {
+    "url": "https://github.com/nexla-opensource/nexla-agent-cli/issues"
+  },
+  "license": "MIT"
+}

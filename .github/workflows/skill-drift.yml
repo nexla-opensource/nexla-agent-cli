@@ -1,0 +1,58 @@
+name: Skill pack drift
+
+# Warns (does not hard-fail) when the vendored Nexla skill pack under
+# src/nexla_cli/skill_pack/ has drifted from its canonical upstream in
+# nexla/express-code. Drift here means "upstream moved" -- the pack should be
+# re-vendored -- not a broken build, so this job surfaces it as a warning
+# annotation instead of failing the PR. See src/nexla_cli/skill_pack/VENDORED_FROM.md.
+
+on:
+  push:
+    paths:
+      - "src/nexla_cli/skill_pack/**"
+      - "scripts/check_skill_pack_drift.py"
+      - ".github/workflows/skill-drift.yml"
+  pull_request:
+    paths:
+      - "src/nexla_cli/skill_pack/**"
+      - "scripts/check_skill_pack_drift.py"
+      - ".github/workflows/skill-drift.yml"
+  schedule:
+    - cron: "0 12 * * 1" # weekly, Mondays 12:00 UTC — catch upstream moves
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Checkout express-code (canonical source)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: nexla/express-code
+          ref: main
+          path: express-code
+          # Private repo: a token with read access is required. Falls back
+          # to the default GITHUB_TOKEN, which only works if express-code is
+          # reachable by it; otherwise set an EXPRESS_CODE_TOKEN secret.
+          token: ${{ secrets.EXPRESS_CODE_TOKEN || github.token }}
+        continue-on-error: true
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Check for drift
+        run: |
+          if [ ! -d express-code/skills/nexla ]; then
+            echo "::warning title=Skill drift check skipped::could not check out nexla/express-code (missing access token?); skipping drift check."
+            exit 0
+          fi
+          if ! python scripts/check_skill_pack_drift.py express-code; then
+            echo "::warning title=Skill pack drift::vendored skill pack has drifted from nexla/express-code; re-vendor per src/nexla_cli/skill_pack/VENDORED_FROM.md."
+          fi
