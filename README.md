@@ -34,16 +34,11 @@ npm install -g @nexla/nexla-cli
 This installs a prebuilt native binary behind a thin `npm/` wrapper — no
 Python interpreter needed on the target machine.
 
-> **Note (npm 11+):** npm now blocks package install scripts by default, and
-> this package fetches its binary in a `postinstall` step. If the `nexla-cli`
-> command isn't found right after install, approve the script and reinstall:
->
-> ```bash
-> npm approve-scripts @nexla/nexla-cli
-> npm install -g @nexla/nexla-cli --foreground-scripts
-> ```
->
-> The PyPI install above has no install script and isn't affected.
+> **Note (npm 11+):** the binary is fetched in a `postinstall` step, so npm
+> may print an `allow-scripts` warning during install. Installation still
+> completes and `nexla-cli` works — no action needed. (`npm approve-scripts`
+> is not required, and does not apply to global installs.) The PyPI/uv install
+> above has no install script at all.
 
 ### From source
 
