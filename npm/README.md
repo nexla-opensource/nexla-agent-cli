@@ -1,9 +1,9 @@
 # nexla-cli
 
-[![npm version](https://img.shields.io/npm/v/nexla-cli.svg)](https://www.npmjs.com/package/nexla-cli)
-[![npm downloads](https://img.shields.io/npm/dm/nexla-cli.svg)](https://www.npmjs.com/package/nexla-cli)
+[![npm version](https://img.shields.io/npm/v/@nexla/nexla-cli.svg)](https://www.npmjs.com/package/@nexla/nexla-cli)
+[![npm downloads](https://img.shields.io/npm/dm/@nexla/nexla-cli.svg)](https://www.npmjs.com/package/@nexla/nexla-cli)
 [![PyPI](https://img.shields.io/pypi/v/nexla-cli.svg?label=PyPI)](https://pypi.org/project/nexla-cli/)
-[![License: MIT](https://img.shields.io/npm/l/nexla-cli.svg)](https://github.com/nexla-opensource/nexla-agent-cli/blob/main/LICENSE)
+[![License: MIT](https://img.shields.io/npm/l/@nexla/nexla-cli.svg)](https://github.com/nexla-opensource/nexla-agent-cli/blob/main/LICENSE)
 
 Command-line client for the [Nexla](https://nexla.com) agent API — list,
 inspect, and build data pipelines straight from a shell or an agent
@@ -17,13 +17,13 @@ instead? See [`nexla-cli` on PyPI](https://pypi.org/project/nexla-cli/).
 ## Install
 
 ```bash
-npm install -g nexla-cli
+npm install -g @nexla/nexla-cli
 ```
 
 Or run it once-off with no global install:
 
 ```bash
-npx nexla-cli sources list
+npx @nexla/nexla-cli sources list
 ```
 
 `postinstall` (`scripts/install.js`) downloads the binary matching your
