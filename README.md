@@ -1,7 +1,7 @@
 # nexla-cli
 
 [![PyPI](https://img.shields.io/pypi/v/nexla-cli.svg?label=PyPI)](https://pypi.org/project/nexla-cli/)
-[![npm version](https://img.shields.io/npm/v/nexla-cli.svg)](https://www.npmjs.com/package/nexla-cli)
+[![npm version](https://img.shields.io/npm/v/@nexla/nexla-cli.svg)](https://www.npmjs.com/package/@nexla/nexla-cli)
 [![License: MIT](https://img.shields.io/github/license/nexla-opensource/nexla-agent-cli.svg)](LICENSE)
 [![Python](https://img.shields.io/pypi/pyversions/nexla-cli.svg)](https://pypi.org/project/nexla-cli/)
 
@@ -10,34 +10,45 @@ Command-line client for the Nexla agent API. Depends on only `typer` and
 
 ## Install
 
+### PyPI (recommended)
+
+Requires Python 3.12+. Installs a self-contained package — nothing to approve,
+works out of the box:
+
 ```bash
-pipx install "git+https://github.com/nexla-opensource/nexla-agent-cli.git"
+uv tool install nexla-cli      # or: pipx install nexla-cli  /  pip install nexla-cli
 ```
 
-Or with `uv`:
+Run once-off without installing:
 
 ```bash
-uv tool install "git+https://github.com/nexla-opensource/nexla-agent-cli.git"
+uvx nexla-cli sources list
 ```
 
-### From Node/TypeScript projects (no Python required)
+### npm (native binary, no Python required)
 
 ```bash
-npm install -g nexla-cli
-# or run once-off:
-npx nexla-cli sources list
+npm install -g @nexla/nexla-cli
 ```
 
 This installs a prebuilt native binary behind a thin `npm/` wrapper — no
 Python interpreter needed on the target machine.
 
-### From PyPI
+> **Note (npm 11+):** npm now blocks package install scripts by default, and
+> this package fetches its binary in a `postinstall` step. If the `nexla-cli`
+> command isn't found right after install, approve the script and reinstall:
+>
+> ```bash
+> npm approve-scripts @nexla/nexla-cli
+> npm install -g @nexla/nexla-cli --foreground-scripts
+> ```
+>
+> The PyPI install above has no install script and isn't affected.
+
+### From source
 
 ```bash
-pip install nexla-cli
-# or
-uvx nexla-cli sources list
-pipx install nexla-cli
+uv tool install "git+https://github.com/nexla-opensource/nexla-agent-cli.git"
 ```
 
 ## Quick start
