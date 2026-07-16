@@ -1,6 +1,6 @@
 [project]
 name = "nexla-cli"
-version = "0.3.0"
+version = "0.3.1"
 description = "Command-line client for the Nexla agent API."
 readme = "README.md"
 # Same MIT license already declared for this codebase in npm/package.json.

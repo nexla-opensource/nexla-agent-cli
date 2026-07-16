@@ -1,6 +1,6 @@
 {
   "name": "@nexla/nexla-cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Command-line client for the Nexla agent API (native binary, no Python required)",
   "author": "Nexla, Inc.",
   "keywords": [
