@@ -19,6 +19,13 @@ BASE_URL = "https://api.test"
 MONITORING_URL = "https://monitoring.test"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    """Point the credential store at a throwaway dir so no test ever reads or
+    writes the developer's real ``~/.config/nexla/config.json``."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+
+
 def mock_openapi(respx_mock: respx.MockRouter, spec: dict[str, Any]) -> respx.Route:
     """Stub ``GET /openapi.json`` with ``spec``.
 

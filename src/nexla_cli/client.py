@@ -17,13 +17,18 @@ from typing import Any
 import httpx
 import typer
 
+from . import config
 from .errors import EXIT, CliError
 
 
 def _base() -> str:
-    url = os.environ.get("NEXLA_API_URL")
+    # Precedence: NEXLA_API_URL env > stored config (from `login`).
+    url = os.environ.get("NEXLA_API_URL") or config.load().get("api_url")
     if not url:
-        raise CliError(EXIT.CONFIG, "NEXLA_API_URL is not set")
+        raise CliError(
+            EXIT.CONFIG,
+            "no API URL: set NEXLA_API_URL or run `nexla-cli login --api-url ...`",
+        )
     return url.rstrip("/")
 
 
@@ -41,16 +46,52 @@ def timeout() -> float:
     return value
 
 
+def _stored_token() -> str | None:
+    # Precedence: NEXLA_TOKEN env > cached bearer from `login`.
+    return os.environ.get("NEXLA_TOKEN") or config.load().get("access_token")
+
+
 def _token() -> str:
-    tok = os.environ.get("NEXLA_TOKEN")
+    tok = _stored_token()
     if not tok:
-        raise CliError(EXIT.CONFIG, "NEXLA_TOKEN is not set")
+        raise CliError(
+            EXIT.CONFIG, "not authenticated: set NEXLA_TOKEN or run `nexla-cli login`"
+        )
     return tok
 
 
 def auth_token() -> str:
     """Public accessor for the bearer token, for other transports (e.g. mcp_client)."""
     return _token()
+
+
+def _reauth() -> str | None:
+    """Mint a fresh bearer from the stored service key, or None if we can't.
+
+    The refresh endpoint is auth-gated (needs a still-valid bearer), so once a
+    token 401s it can't rotate itself -- the only credential that can re-mint
+    is the service key `login` stashed. Re-run `/login`, persist the new
+    bearer, and return it. No stored service key (env-only auth, or CI) -> None.
+    """
+    sk = config.load().get("service_key")
+    if not sk:
+        return None
+    try:
+        with httpx.Client(base_url=_base(), timeout=timeout()) as c:
+            r = c.post("/login", json={"service_key": sk})
+    except httpx.HTTPError:
+        return None
+    if not r.is_success:
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    tok = data.get("access_token")
+    if not isinstance(tok, str) or not tok:
+        return None
+    config.save(access_token=tok, expires_at=data.get("expires_at"))
+    return tok
 
 
 def _envelope(r: httpx.Response) -> dict[str, Any]:
@@ -95,15 +136,23 @@ def request(
     any non-2xx response, with ``EXIT.from_status`` mapping the upstream
     status code to a stable CLI exit code.
     """
-    headers: dict[str, str] = {}
-    if require_auth:
-        headers["Authorization"] = f"Bearer {_token()}"
+    def _send(token: str | None) -> httpx.Response:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        with httpx.Client(base_url=_base(), timeout=timeout(), headers=headers) as c:
+            try:
+                return c.request(method, path, params=params, json=json)
+            except httpx.HTTPError as e:
+                raise CliError(EXIT.UPSTREAM, f"request failed: {e}") from e
 
-    with httpx.Client(base_url=_base(), timeout=timeout(), headers=headers) as c:
-        try:
-            r = c.request(method, path, params=params, json=json)
-        except httpx.HTTPError as e:
-            raise CliError(EXIT.UPSTREAM, f"request failed: {e}") from e
+    token = _token() if require_auth else None
+    r = _send(token)
+    # The cached bearer expired -> transparently re-mint from the stored
+    # service key and retry once (see `_reauth`). One retry only; if it still
+    # 401s the error falls through to the normal AUTH mapping below.
+    if r.status_code == 401 and require_auth:
+        new_token = _reauth()
+        if new_token is not None and new_token != token:
+            r = _send(new_token)
 
     if r.is_success:
         if r.status_code == 204 or not r.content:

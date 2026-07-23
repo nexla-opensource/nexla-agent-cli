@@ -238,6 +238,8 @@ def _root(
 
 
 app.command("login")(_wrap_cli_error(login_module.login))
+app.command("logout")(_wrap_cli_error(login_module.logout))
+app.command("whoami")(_wrap_cli_error(login_module.whoami))
 
 for _mod in (
     sources,
