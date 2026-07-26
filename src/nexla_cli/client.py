@@ -23,7 +23,12 @@ from .errors import EXIT, CliError
 def _base() -> str:
     url = os.environ.get("NEXLA_API_URL")
     if not url:
-        raise CliError(EXIT.CONFIG, "NEXLA_API_URL is not set")
+        raise CliError(
+            EXIT.CONFIG,
+            "NEXLA_API_URL is not set",
+            hint="set NEXLA_API_URL to your deployed Nexla agent API, "
+            "or pass --api-url",
+        )
     return url.rstrip("/")
 
 
@@ -44,7 +49,12 @@ def timeout() -> float:
 def _token() -> str:
     tok = os.environ.get("NEXLA_TOKEN")
     if not tok:
-        raise CliError(EXIT.CONFIG, "NEXLA_TOKEN is not set")
+        raise CliError(
+            EXIT.CONFIG,
+            "NEXLA_TOKEN is not set",
+            hint="run `nexla-cli login --service-key <key>` and export the "
+            "printed token as NEXLA_TOKEN",
+        )
     return tok
 
 

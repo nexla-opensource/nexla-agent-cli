@@ -36,6 +36,16 @@ class EXIT(IntEnum):
             return EXIT.UPSTREAM
         return EXIT.ERROR
 
+    @property
+    def slug(self) -> str:
+        """Stable machine-parseable name for this exit code (for JSON errors).
+
+        Agents can branch on ``error_type`` without parsing message text or
+        memorizing numbers. Kept in lockstep with the code so the two never
+        disagree.
+        """
+        return self.name.lower()
+
 
 class CliError(Exception):
     """Raised anywhere in the CLI to signal a specific exit code + message.
@@ -47,9 +57,25 @@ class CliError(Exception):
     """
 
     def __init__(
-        self, code: int, message: str, *, envelope: dict[str, Any] | None = None
+        self,
+        code: int,
+        message: str,
+        *,
+        envelope: dict[str, Any] | None = None,
+        hint: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.envelope = envelope
+        # An optional next step for the caller (human or agent): the command to
+        # run, the env var to set, the flag to add. Surfaced in the error output.
+        self.hint = hint
+
+    @property
+    def error_type(self) -> str:
+        """Machine-parseable error category, derived from the exit code."""
+        try:
+            return EXIT(self.code).slug
+        except ValueError:
+            return "error"
