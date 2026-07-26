@@ -109,11 +109,52 @@ def update(
     )
 
 
+@app.command("usage")
+def usage(ctx: typer.Context, credential_id: int) -> None:
+    """List the sources and sinks that reference this credential.
+
+    Handy before ``delete``, which the API refuses while a credential is in
+    use (with a bare "Data credentials in use"). The list views omit
+    ``credential_id``, so this reads each candidate's detail. To avoid a
+    full-org sweep it first narrows to the credential's own connector (the
+    list views DO expose ``connector``), then checks only those details. (A
+    server-side usage endpoint / a ``credential_id`` on the list view would
+    remove the scan entirely.)
+    """
+    cred = client.request("GET", f"/nexla/credentials/{credential_id}")
+    connector = cred.get("connector") if isinstance(cred, dict) else None
+    params = {"connector": connector} if connector else {}
+    scope = f"{connector} " if connector else ""
+    typer.echo(f"scanning {scope}sources and sinks for references...", err=True)
+    dependents: list[dict[str, object]] = []
+    for rtype, path in (("source", "/nexla/sources"), ("sink", "/nexla/sinks")):
+        for item in client.paginate(path, params=params):
+            rid = item.get("id")
+            if rid is None:
+                continue
+            detail = client.request("GET", f"{path}/{rid}")
+            if isinstance(detail, dict) and detail.get("credential_id") == credential_id:
+                dependents.append({"type": rtype, "id": rid, "name": detail.get("name")})
+    output.emit(
+        dependents,
+        mode=output.ctx_mode(ctx),
+        fields=output.ctx_fields(ctx),
+        columns=["type", "id", "name"],
+    )
+
+
 @app.command("delete")
 def delete(ctx: typer.Context, credential_id: int, dry_run: bool = DRY_RUN_OPT) -> None:
-    """Delete a credential."""
+    """Delete a credential.
+
+    In-use credentials can't be deleted until their sources/sinks are
+    detached; run ``credentials usage <id>`` to see what references one.
+    """
     if dry_run:
         dryrun.run_dry_run(resource="credentials", verb="delete", body={})
     output.emit_delete(
-        ctx, client.request("DELETE", f"/nexla/credentials/{credential_id}"), credential_id
+        ctx,
+        client.request("DELETE", f"/nexla/credentials/{credential_id}"),
+        credential_id,
+        in_use_hint=f"run `nexla-cli credentials usage {credential_id}` to see what references it",
     )
