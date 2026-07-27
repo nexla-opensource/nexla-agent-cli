@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json as jsonlib
 import os
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -65,14 +66,61 @@ def auth_token() -> str:
     return _token()
 
 
+def _refresh_window_seconds() -> int:
+    """How close to expiry (seconds) we proactively refresh. Small on purpose."""
+    return 60
+
+
+def _maybe_refresh(token: str) -> str:
+    """Rotate a config-sourced bearer that's about to expire, before it 401s.
+
+    ``/auth/token/refresh`` is auth-gated -- it needs a *still-valid* bearer --
+    so the only time it can be used is proactively, just before expiry. Doing
+    this means the common path never 401s and never needs the service key at
+    all. Best-effort: on any failure fall through with the old token and let
+    the 401 path (:func:`_reauth`) decide.
+
+    Never fires for an env-supplied ``NEXLA_TOKEN``: that token isn't ours to
+    rotate, and rewriting the stored config from an env-var session would be
+    surprising.
+    """
+    if os.environ.get("NEXLA_TOKEN"):
+        return token
+    exp = config.load().get("expires_at")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+        return token
+    if exp - time.time() > _refresh_window_seconds():
+        return token
+    try:
+        with httpx.Client(
+            base_url=_base(), timeout=timeout(), headers={"Authorization": f"Bearer {token}"}
+        ) as c:
+            r = c.post("/auth/token/refresh", json={})
+        if not r.is_success:
+            return token
+        data = r.json()
+    except (httpx.HTTPError, ValueError):
+        return token
+    fresh = data.get("access_token")
+    if not isinstance(fresh, str) or not fresh:
+        return token
+    config.save(access_token=fresh, expires_at=data.get("expires_at"))
+    return fresh
+
+
 def _reauth() -> str | None:
     """Mint a fresh bearer from the stored service key, or None if we can't.
 
-    The refresh endpoint is auth-gated (needs a still-valid bearer), so once a
-    token 401s it can't rotate itself -- the only credential that can re-mint
-    is the service key `login` stashed. Re-run `/login`, persist the new
-    bearer, and return it. No stored service key (env-only auth, or CI) -> None.
+    Last resort after a 401: the refresh endpoint needs a still-valid bearer,
+    so an already-expired token can't rotate itself -- only the service key can
+    re-mint, and only if the user opted into storing it
+    (``login --store-service-key``). Not stored (the default), or env-supplied
+    auth -> None, and the 401 surfaces as EXIT.AUTH.
     """
+    if os.environ.get("NEXLA_TOKEN"):
+        # An env-supplied token isn't ours to replace, and re-minting here would
+        # silently rewrite the stored config during an env-var session.
+        return None
     sk = config.load().get("service_key")
     if not sk:
         return None
@@ -144,7 +192,7 @@ def request(
             except httpx.HTTPError as e:
                 raise CliError(EXIT.UPSTREAM, f"request failed: {e}") from e
 
-    token = _token() if require_auth else None
+    token = _maybe_refresh(_token()) if require_auth else None
     r = _send(token)
     # The cached bearer expired -> transparently re-mint from the stored
     # service key and retry once (see `_reauth`). One retry only; if it still

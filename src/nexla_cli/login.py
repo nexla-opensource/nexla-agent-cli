@@ -79,6 +79,15 @@ def login(
         "--monitoring-url",
         help="Persist the monitoring MCP URL (for `triage`) so it needs no env var",
     ),
+    store_service_key: bool = typer.Option(
+        False,
+        "--store-service-key",
+        help=(
+            "Also persist the service key, so an expired session can be re-minted "
+            "without re-running login. Off by default: the key is a durable secret, "
+            "and the stored bearer already auto-refreshes before it expires."
+        ),
+    ),
     no_store: bool = typer.Option(
         False,
         "--no-store",
@@ -116,7 +125,9 @@ def login(
         saved = config.save(
             api_url=client._base(),
             monitoring_url=monitoring_url,  # None -> left untouched
-            service_key=service_key,
+            # Opt-in only: a durable secret at rest is a bigger blast radius than
+            # a short-lived bearer, and proactive refresh covers the normal case.
+            service_key=service_key if store_service_key else None,
             access_token=resp["access_token"],
             expires_at=resp.get("expires_at"),
             user_email=user.get("email"),  # for `whoami`

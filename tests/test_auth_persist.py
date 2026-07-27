@@ -42,7 +42,8 @@ def test_login_persists_credentials(cli_app, respx_mock: respx.MockRouter, monke
     )
     assert result.exit_code == 0
     stored = config.load()
-    assert stored["service_key"] == "svc-key-123"
+    # The service key is NOT stored by default -- opt in with --store-service-key.
+    assert "service_key" not in stored
     assert stored["access_token"] == "fresh-tok"
     assert stored["api_url"] == BASE_URL
     # secret at rest must be owner-only.
@@ -279,3 +280,87 @@ def test_obtain_service_key_abort_is_clean_error(monkeypatch) -> None:
         login_module._obtain_service_key()
     assert exc.value.code == EXIT.CONFIG
     assert "service key" in exc.value.message.lower()
+
+
+def test_store_service_key_flag_opts_in(cli_app, respx_mock: respx.MockRouter, monkeypatch) -> None:
+    _no_env(monkeypatch)
+    respx_mock.post(f"{BASE_URL}/login").mock(return_value=httpx.Response(200, json=_LOGIN_BODY))
+    result = CliRunner().invoke(
+        cli_app,
+        ["login", "--service-key", "svc-key-123", "--api-url", BASE_URL, "--store-service-key"],
+    )
+    assert result.exit_code == 0
+    assert config.load()["service_key"] == "svc-key-123"
+
+
+def test_proactive_refresh_before_expiry(cli_app, respx_mock: respx.MockRouter, monkeypatch) -> None:
+    # A config bearer about to expire is rotated via /auth/token/refresh BEFORE
+    # the request, so the call never 401s and no service key is needed.
+    _no_env(monkeypatch)
+    import time as _time
+
+    config.save(api_url=BASE_URL, access_token="old-tok", expires_at=int(_time.time()) + 10)
+    refresh = respx_mock.post(f"{BASE_URL}/auth/token/refresh").mock(
+        return_value=httpx.Response(
+            200, json={"access_token": "rotated-tok", "expires_at": int(_time.time()) + 3600}
+        )
+    )
+    sources = respx_mock.get(f"{BASE_URL}/nexla/sources").mock(
+        return_value=httpx.Response(200, json={"items": [], "next_page": None})
+    )
+    result = CliRunner().invoke(cli_app, ["sources", "list"])
+    assert result.exit_code == 0, result.output
+    assert refresh.called
+    # request used the rotated token, and it was written back
+    assert sources.calls.last.request.headers["authorization"] == "Bearer rotated-tok"
+    assert config.load()["access_token"] == "rotated-tok"
+
+
+def test_no_refresh_when_token_is_fresh(cli_app, respx_mock: respx.MockRouter, monkeypatch) -> None:
+    _no_env(monkeypatch)
+    import time as _time
+
+    config.save(api_url=BASE_URL, access_token="good-tok", expires_at=int(_time.time()) + 7200)
+    refresh = respx_mock.post(f"{BASE_URL}/auth/token/refresh")
+    respx_mock.get(f"{BASE_URL}/nexla/sources").mock(
+        return_value=httpx.Response(200, json={"items": [], "next_page": None})
+    )
+    result = CliRunner().invoke(cli_app, ["sources", "list"])
+    assert result.exit_code == 0
+    assert not refresh.called  # far from expiry -> no round trip
+
+
+def test_no_refresh_for_env_token(cli_app, respx_mock: respx.MockRouter, monkeypatch) -> None:
+    # An env-supplied token is not ours to rotate, even if the stored config
+    # says it's expiring.
+    import time as _time
+
+    monkeypatch.setenv("NEXLA_API_URL", BASE_URL)
+    monkeypatch.setenv("NEXLA_TOKEN", "env-tok")
+    config.save(api_url=BASE_URL, access_token="cfg-tok", expires_at=int(_time.time()) + 5)
+    refresh = respx_mock.post(f"{BASE_URL}/auth/token/refresh")
+    sources = respx_mock.get(f"{BASE_URL}/nexla/sources").mock(
+        return_value=httpx.Response(200, json={"items": [], "next_page": None})
+    )
+    result = CliRunner().invoke(cli_app, ["sources", "list"])
+    assert result.exit_code == 0
+    assert not refresh.called
+    assert sources.calls.last.request.headers["authorization"] == "Bearer env-tok"
+
+
+def test_env_token_401_never_rewrites_stored_config(
+    cli_app, respx_mock: respx.MockRouter, monkeypatch
+) -> None:
+    # Regression: with NEXLA_TOKEN set AND a stored service key, a 401 must NOT
+    # re-mint and overwrite the stored bearer -- env auth isn't ours to rotate.
+    monkeypatch.setenv("NEXLA_API_URL", BASE_URL)
+    monkeypatch.setenv("NEXLA_TOKEN", "env-tok")
+    config.save(api_url=BASE_URL, service_key="svc-key-123", access_token="cfg-tok")
+    respx_mock.get(f"{BASE_URL}/nexla/sources").mock(
+        return_value=httpx.Response(401, json={"detail": "unauthorized"})
+    )
+    login = respx_mock.post(f"{BASE_URL}/login")
+    result = CliRunner().invoke(cli_app, ["sources", "list"])
+    assert result.exit_code == EXIT.AUTH
+    assert not login.called  # no re-mint from the env session
+    assert config.load()["access_token"] == "cfg-tok"  # store untouched
