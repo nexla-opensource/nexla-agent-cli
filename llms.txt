@@ -1,0 +1,39 @@
+# nexla-cli
+
+> Command-line client for the Nexla agent API — create and operate sources,
+> sinks, nexsets, credentials, flows, connectors, toolsets, and flow/log
+> triage. Built for non-interactive use by agents: `-o json`/`-o ndjson`
+> output, a stable numeric exit-code taxonomy, `--dry-run` on every mutation,
+> `--page-all` for complete lists, and a live `schema` command. Depends only
+> on `typer` and `httpx`.
+
+## Operating the CLI
+
+- [AGENTS.md](AGENTS.md): repo-root operating guide — non-interactive
+  invocation, the JSON/NDJSON + stderr-error contract, the 7 exit codes,
+  `--dry-run`/`--page-all` safety, discovery, and auth env vars.
+- [src/nexla_cli/AGENTS.md](src/nexla_cli/AGENTS.md): CLI invariants an agent
+  can't infer from `--help` — output modes, `--json`/`--params` precedence,
+  `--wait-until`, DB-sink table preflight, probe param shapes, standalone-OAuth
+  limitation.
+
+## Install & usage
+
+- [README.md](README.md): install (PyPI/uv, npm, source), quick start, global
+  flags, raw JSON payloads, response sanitization, and the full command
+  reference table.
+- `nexla-cli --help` / `nexla-cli <group> --help`: live command surface.
+- `nexla-cli schema [<resource>.<verb>]`: machine-readable OpenAPI subset for
+  one command or the whole `/nexla/*` API surface.
+
+## Skill pack
+
+- [Using this CLI from Claude Code](README.md#using-this-cli-from-claude-code):
+  `nexla-cli skill install` ships `SKILL.md` + `AGENTS.md` + the vendored Nexla
+  domain reference (`skill_pack/`) into an agent's skills directory.
+
+## Repo
+
+- [Source repository](https://github.com/nexla-opensource/nexla-agent-cli)
+- [CHANGELOG.md](CHANGELOG.md)
+- [LICENSE](LICENSE): MIT
