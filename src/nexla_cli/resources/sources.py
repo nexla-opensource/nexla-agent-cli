@@ -12,7 +12,7 @@ import typer
 
 from .. import client, dryrun, output, poll, validate
 from ..errors import EXIT, CliError
-from ._common import DRY_RUN_OPT, JSON_OPT, PARAMS_OPT, emit_list
+from ._common import DRY_RUN_OPT, JSON_OPT, PARAMS_OPT, VERIFY_OPT, emit_list, emit_write
 
 app = typer.Typer(name="sources", help="Manage Nexla data sources.", no_args_is_help=True)
 
@@ -163,11 +163,14 @@ def create(
     credential_id: int | None = typer.Option(None),
     endpoint: str | None = typer.Option(None),
     mode: str | None = typer.Option(None, help="db connectors only: 'default' or 'query'"),
-    config: str = typer.Option("{}", help="JSON object of connector-specific fields"),
+    config: str = typer.Option(
+        "{}", help="JSON object of connector-specific fields; accepts @file.json or @-"
+    ),
     schedule: str = typer.Option("recurring", help="'recurring' or 'once'"),
     json_body: str | None = JSON_OPT,
     params: list[str] = PARAMS_OPT,
     dry_run: bool = DRY_RUN_OPT,
+    verify: bool = VERIFY_OPT,
 ) -> None:
     """Create and activate a source."""
     named: dict[str, object] = {
@@ -187,10 +190,11 @@ def create(
     )
     if dry_run:
         dryrun.run_dry_run(resource="sources", verb="create", body=body)
-    output.emit(
+    emit_write(
+        ctx,
         client.request("POST", "/nexla/sources", json=body),
-        mode=output.ctx_mode(ctx),
-        fields=output.ctx_fields(ctx),
+        "/nexla/sources",
+        verify=verify,
     )
 
 
@@ -200,10 +204,11 @@ def update(
     source_id: int,
     name: str | None = typer.Option(None),
     description: str | None = typer.Option(None),
-    config: str | None = typer.Option(None, help="JSON object"),
+    config: str | None = typer.Option(None, help="JSON object; accepts @file.json or @-"),
     json_body: str | None = JSON_OPT,
     params: list[str] = PARAMS_OPT,
     dry_run: bool = DRY_RUN_OPT,
+    verify: bool = VERIFY_OPT,
     no_verify: bool = _NO_VERIFY_OPT,
 ) -> None:
     """Update a source's name/description/config.
@@ -212,6 +217,10 @@ def update(
     with a non-zero exit if a field the user explicitly set did not
     actually persist -- guarding a known API-side bug where a PATCH can
     return success yet silently no-op. Pass ``--no-verify`` to skip.
+
+    ``--verify`` is a separate, additive thing: it changes *what is
+    emitted* (the re-read resource rather than the PATCH response). The
+    ``--no-verify`` persistence check runs independently of it.
     """
     named: dict[str, object] = {
         "name": name,
@@ -225,10 +234,12 @@ def update(
     )
     if dry_run:
         dryrun.run_dry_run(resource="sources", verb="update", body=body)
-    output.emit(
+    emit_write(
+        ctx,
         client.request("PATCH", f"/nexla/sources/{source_id}", json=body),
-        mode=output.ctx_mode(ctx),
-        fields=output.ctx_fields(ctx),
+        "/nexla/sources",
+        verify=verify,
+        resource_id=source_id,
     )
     # Read-after-write postcondition check. Emitted output above is the
     # primary PATCH response (the user sees it first); the warning + nonzero
@@ -273,7 +284,7 @@ def delete(ctx: typer.Context, source_id: int, dry_run: bool = DRY_RUN_OPT) -> N
 def sample(
     ctx: typer.Context,
     source_id: int,
-    payload: str = typer.Option(..., help="JSON payload to POST"),
+    payload: str = typer.Option(..., help="JSON payload to POST; accepts @file.json or @-"),
     dry_run: bool = DRY_RUN_OPT,
 ) -> None:
     """Post a sample payload to a webhook source."""

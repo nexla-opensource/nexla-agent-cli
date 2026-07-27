@@ -688,3 +688,70 @@ def test_create_pg_sink_unsafe_table_name_skips_sample_fallback(
     assert create_route.called
     assert "WARNING" in result.output
     assert "sample" not in _probe_actions(probe_route)
+
+
+# ---- --verify read-after-write ----------------------------------------------
+
+
+def test_create_verify_emits_the_read_back(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+) -> None:
+    _mock_describe_kind(respx_mock, "s3", "file")
+    post = respx_mock.post(f"{BASE_URL}/nexla/sinks").mock(
+        return_value=httpx.Response(201, json={"id": 2, "name": "new-sink", "status": "INIT"})
+    )
+    get = respx_mock.get(f"{BASE_URL}/nexla/sinks/2").mock(
+        return_value=httpx.Response(200, json={"id": 2, "name": "new-sink", "status": "ACTIVE"})
+    )
+    result = runner.invoke(
+        cli_app,
+        [
+            "sinks",
+            "create",
+            "--name",
+            "new-sink",
+            "--nexset-id",
+            "10",
+            "--credential-id",
+            "20",
+            "--connector",
+            "s3",
+            "--verify",
+        ],
+    )
+    assert result.exit_code == 0
+    assert post.called and get.called
+    assert "ACTIVE" in result.stdout
+    assert "INIT" not in result.stdout
+
+
+def test_update_verify_emits_the_read_back(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+) -> None:
+    patch = respx_mock.patch(f"{BASE_URL}/nexla/sinks/1").mock(
+        return_value=httpx.Response(200, json={"id": 1, "name": "stale"})
+    )
+    get = respx_mock.get(f"{BASE_URL}/nexla/sinks/1").mock(
+        return_value=httpx.Response(200, json={"id": 1, "name": "renamed"})
+    )
+    result = runner.invoke(cli_app, ["sinks", "update", "1", "--name", "renamed", "--verify"])
+    assert result.exit_code == 0
+    assert patch.called and get.called
+    assert "renamed" in result.stdout
+    assert "stale" not in result.stdout
+
+
+def test_update_verify_failing_read_back_still_exits_zero(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.patch(f"{BASE_URL}/nexla/sinks/1").mock(
+        return_value=httpx.Response(200, json={"id": 1, "name": "renamed"})
+    )
+    get = respx_mock.get(f"{BASE_URL}/nexla/sinks/1").mock(
+        return_value=httpx.Response(404, json={"message": "gone"})
+    )
+    result = runner.invoke(cli_app, ["sinks", "update", "1", "--name", "renamed", "--verify"])
+    assert result.exit_code == 0  # the PATCH succeeded; the read-back must not fail it
+    assert get.called
+    assert "--verify read-back failed" in result.stderr
+    assert "renamed" in result.stdout

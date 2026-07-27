@@ -33,7 +33,10 @@ def not_in_v1(feature: str) -> NoReturn:
 # Body options shared by every create/update command. The precedence is
 # named options > --params > --json (see validate.merge_body).
 JSON_OPT = typer.Option(
-    None, "--json", help="Raw JSON body; merged under named options, over --params"
+    None,
+    "--json",
+    help="Raw JSON body; merged under named options, over --params. "
+    "Accepts @path/to/body.json or @- to read STDIN",
 )
 PARAMS_OPT = typer.Option(
     [], "--params", help="key=value body overrides (repeatable); lowest precedence"
@@ -43,6 +46,48 @@ DRY_RUN_OPT = typer.Option(
     "--dry-run",
     help="Shallow structural lint (required fields + top-level types); fire no mutating call",
 )
+VERIFY_OPT = typer.Option(
+    False,
+    "--verify",
+    help="After the write, re-GET the resource and emit that instead of the write response",
+)
+
+
+def emit_write(
+    ctx: typer.Context,
+    written: Any,
+    base_path: str,
+    *,
+    verify: bool,
+    resource_id: object = None,
+) -> None:
+    """Emit a create/update response — or, under ``--verify``, the read-back.
+
+    A create/update response is whatever the mutating endpoint chose to
+    echo, which is not necessarily the resource's settled server-side
+    state (defaults filled in, values normalized, status still
+    transitioning). ``--verify`` re-GETs the resource and emits *that*, so
+    an agent gets authoritative post-write state from a single command
+    instead of having to chain a second ``get`` call.
+
+    The write has already succeeded by the time we get here, so a failing
+    read-back must never turn a successful mutation into a non-zero exit:
+    it warns on stderr and falls back to emitting the write response.
+    ``resource_id`` is passed explicitly by ``update`` (which knows the
+    id); ``create`` leaves it ``None`` and it is taken from the response.
+    """
+    if verify:
+        rid = resource_id
+        if rid is None and isinstance(written, dict):
+            rid = written.get("id")
+        if rid is None:
+            typer.echo("warning: --verify skipped: no id in the write response", err=True)
+        else:
+            try:
+                written = client.request("GET", f"{base_path}/{rid}")
+            except Exception as e:  # noqa: BLE001 - the write succeeded; never fail on read-back
+                typer.echo(f"warning: --verify read-back failed: {e}", err=True)
+    output.emit(written, mode=output.ctx_mode(ctx), fields=output.ctx_fields(ctx))
 
 
 def emit_list(
