@@ -11,7 +11,7 @@ import typer
 
 from .. import client, dryrun, output, poll, validate
 from . import preflight
-from ._common import DRY_RUN_OPT, JSON_OPT, PARAMS_OPT, emit_list
+from ._common import DRY_RUN_OPT, JSON_OPT, PARAMS_OPT, VERIFY_OPT, emit_list, emit_write
 
 app = typer.Typer(name="sinks", help="Manage Nexla data sinks.", no_args_is_help=True)
 
@@ -85,6 +85,7 @@ def create(
     json_body: str | None = JSON_OPT,
     params: list[str] = PARAMS_OPT,
     dry_run: bool = DRY_RUN_OPT,
+    verify: bool = VERIFY_OPT,
     skip_table_check: bool = _SKIP_TABLE_CHECK_OPT,
 ) -> None:
     """Create and activate a sink."""
@@ -105,10 +106,11 @@ def create(
         dryrun.run_dry_run(resource="sinks", verb="create", body=body)
     if not skip_table_check:
         preflight.check_table_exists(credential_id, connector, body.get("config"))
-    output.emit(
+    emit_write(
+        ctx,
         client.request("POST", "/nexla/sinks", json=body),
-        mode=output.ctx_mode(ctx),
-        fields=output.ctx_fields(ctx),
+        "/nexla/sinks",
+        verify=verify,
     )
 
 
@@ -122,6 +124,7 @@ def update(
     json_body: str | None = JSON_OPT,
     params: list[str] = PARAMS_OPT,
     dry_run: bool = DRY_RUN_OPT,
+    verify: bool = VERIFY_OPT,
 ) -> None:
     """Update a sink's name/description/config."""
     named: dict[str, object] = {
@@ -136,10 +139,12 @@ def update(
     )
     if dry_run:
         dryrun.run_dry_run(resource="sinks", verb="update", body=body)
-    output.emit(
+    emit_write(
+        ctx,
         client.request("PATCH", f"/nexla/sinks/{sink_id}", json=body),
-        mode=output.ctx_mode(ctx),
-        fields=output.ctx_fields(ctx),
+        "/nexla/sinks",
+        verify=verify,
+        resource_id=sink_id,
     )
 
 

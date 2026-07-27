@@ -6,7 +6,7 @@ import httpx
 import respx
 from typer.testing import CliRunner
 
-from .conftest import BASE_URL
+from .conftest import BASE_URL, mock_openapi
 
 
 def test_list(runner: CliRunner, cli_app, respx_mock: respx.MockRouter) -> None:
@@ -426,3 +426,106 @@ def test_create_config_at_file_invalid_json_exits_validation(
     assert result.exit_code == 2
     assert "--config is not valid JSON" in result.stderr
     assert not route.called
+
+
+# ---- --verify read-after-write ----------------------------------------------
+
+
+def test_create_verify_emits_the_read_back(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+):
+    """`--verify` must fire both routes and emit the GET, not the POST body."""
+    post = respx_mock.post(f"{BASE_URL}/nexla/sources").mock(
+        return_value=httpx.Response(201, json={"id": 7, "name": "s", "status": "INIT"})
+    )
+    get = respx_mock.get(f"{BASE_URL}/nexla/sources/7").mock(
+        return_value=httpx.Response(200, json={"id": 7, "name": "s", "status": "ACTIVE"})
+    )
+    result = runner.invoke(
+        cli_app, ["sources", "create", "--name", "s", "--connector", "webhook", "--verify"]
+    )
+    assert result.exit_code == 0
+    assert post.called and get.called
+    assert "ACTIVE" in result.stdout
+    assert "INIT" not in result.stdout
+
+
+def test_update_verify_emits_the_read_back(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+):
+    patch = respx_mock.patch(f"{BASE_URL}/nexla/sources/3").mock(
+        return_value=httpx.Response(200, json={"id": 3, "name": "old"})
+    )
+    get = respx_mock.get(f"{BASE_URL}/nexla/sources/3").mock(
+        return_value=httpx.Response(200, json={"id": 3, "name": "new"})
+    )
+    result = runner.invoke(cli_app, ["sources", "update", "3", "--name", "new", "--verify"])
+    assert result.exit_code == 0
+    assert patch.called and get.called
+    assert "new" in result.stdout
+
+
+def test_create_verify_failing_read_back_still_exits_zero(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+):
+    """The write succeeded -- a failing read-back warns but must not fail."""
+    respx_mock.post(f"{BASE_URL}/nexla/sources").mock(
+        return_value=httpx.Response(201, json={"id": 7, "name": "s"})
+    )
+    get = respx_mock.get(f"{BASE_URL}/nexla/sources/7").mock(
+        return_value=httpx.Response(500, json={"message": "boom"})
+    )
+    result = runner.invoke(
+        cli_app, ["sources", "create", "--name", "s", "--connector", "webhook", "--verify"]
+    )
+    assert result.exit_code == 0
+    assert get.called
+    assert "--verify read-back failed" in result.stderr
+    assert '"id": 7' in result.stdout  # fell back to the write response
+
+
+def test_verify_with_dry_run_fires_nothing(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+):
+    mock_openapi(respx_mock, _DRY_RUN_SPEC)
+    post = respx_mock.post(f"{BASE_URL}/nexla/sources")
+    get = respx_mock.get(f"{BASE_URL}/nexla/sources/7")
+    result = runner.invoke(
+        cli_app,
+        ["sources", "create", "--name", "s", "--connector", "webhook", "--verify", "--dry-run"],
+    )
+    assert result.exit_code == 0
+    assert not post.called  # the write never fired
+    assert not get.called  # ...so --verify has nothing to read back
+
+
+_DRY_RUN_SPEC = {
+    "openapi": "3.1.0",
+    "paths": {
+        "/nexla/sources": {
+            "post": {
+                "operationId": "create_source_nexla_sources_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/CreateSourceIn"}
+                        }
+                    }
+                },
+            }
+        }
+    },
+    "components": {
+        "schemas": {
+            "CreateSourceIn": {
+                "type": "object",
+                "required": ["name", "connector"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "connector": {"type": "string"},
+                    "schedule": {"type": "string"},
+                },
+            }
+        }
+    },
+}
