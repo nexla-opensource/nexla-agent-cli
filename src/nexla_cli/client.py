@@ -88,6 +88,14 @@ def _message_from_envelope(envelope: dict[str, Any], *, fallback: str) -> str:
         val = envelope.get(key)
         if isinstance(val, str) and val:
             return val
+        # Some routes nest a richer error under detail, e.g.
+        # {"error": "nexla.x_failed", "detail": {"code": ..., "message": ...}}.
+        # Prefer the human-readable message over the machine code so table
+        # mode isn't stuck showing the bare `nexla.x_failed` slug.
+        if isinstance(val, dict):
+            nested = val.get("message") or val.get("detail")
+            if isinstance(nested, str) and nested:
+                return nested
     return fallback
 
 
