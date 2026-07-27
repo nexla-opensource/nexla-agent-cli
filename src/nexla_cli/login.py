@@ -14,45 +14,94 @@ import contextlib
 import os
 import sys
 import time
+from typing import Any
 
 import typer
 
-from . import client, config, output
+from . import client, config, oauth, output
 from .errors import EXIT, CliError
 from .sanitize import sanitize
 
 
-def _select_auth_method() -> None:
-    """gh-style menu: pick an auth method (numbered, stdlib-only, on stderr).
+def _oauth_client_id() -> str | None:
+    """The CLI's public OAuth client_id, or None if none is configured.
 
-    Loops until the user picks an available method. Browser/OAuth is listed
-    but not yet selectable -- the Nexla auth server has no device-grant
-    endpoint yet (see TODO A). All prompts go to stderr so stdout stays
+    Not a secret (PKCE is the proof), but not guessable either, so it has to be
+    supplied until a native app is registered and a default can ship.
+    """
+    return os.environ.get("NEXLA_OAUTH_CLIENT_ID") or None
+
+
+def _browser_login() -> dict[str, Any]:
+    """Loopback PKCE against the IdP, then exchange the id-token for a bearer.
+
+    Express's ``/auth/microsoft/login`` accepts a bare ``microsoft_id_token``
+    and returns the same ``LoginResponse`` as ``/login``, so the whole
+    persistence path downstream is unchanged.
+    """
+    client_id = _oauth_client_id()
+    if client_id is None:
+        raise CliError(
+            EXIT.CONFIG,
+            "browser sign-in needs an OAuth client id: set NEXLA_OAUTH_CLIENT_ID "
+            "(a registered public/native app), or authenticate with --service-key",
+        )
+    authority = os.environ.get("NEXLA_OAUTH_AUTHORITY") or oauth.DEFAULT_AUTHORITY
+    id_token = oauth.obtain_id_token(client_id, authority=authority)
+    resp = client.request(
+        "POST",
+        "/auth/microsoft/login",
+        json={"microsoft_id_token": id_token},
+        require_auth=False,
+    )
+    if not isinstance(resp, dict) or not resp.get("access_token"):
+        raise CliError(EXIT.AUTH, "sign-in succeeded but no access token was returned")
+    return resp
+
+
+def _select_auth_method() -> bool:
+    """gh-style menu: pick an auth method. Returns True for browser sign-in.
+
+    Browser sign-in is only offered when a public ``client_id`` is configured
+    (``NEXLA_OAUTH_CLIENT_ID``); until a native app is registered there is
+    nothing to authorize against, so the option is shown as unavailable rather
+    than failing after the fact. All prompts go to stderr so stdout stays
     token-only for ``export NEXLA_TOKEN=$(nexla-cli login)``.
     """
+    browser_ready = _oauth_client_id() is not None
     while True:
         typer.echo("How would you like to authenticate nexla-cli?", err=True)
         typer.echo("  1. Paste a service key", err=True)
-        typer.echo("  2. Log in with a browser (OAuth) [not yet available]", err=True)
+        typer.echo(
+            "  2. Log in with a browser"
+            + ("" if browser_ready else " [unavailable: NEXLA_OAUTH_CLIENT_ID not set]"),
+            err=True,
+        )
         choice = typer.prompt("Choose", default="1", err=True).strip().lower()
         if choice in ("1", "service key", "key", "paste"):
-            return
-        if choice == "2":
+            return False
+        if choice in ("2", "browser", "oauth", "sso"):
+            if browser_ready:
+                return True
             typer.echo(
-                "Browser OAuth isn't available yet (needs server-side device "
-                "grant); use a service key for now.",
+                "Browser sign-in needs a registered OAuth client: set "
+                "NEXLA_OAUTH_CLIENT_ID (or use a service key).",
                 err=True,
             )
             continue
         typer.echo(f"invalid choice: {choice!r}", err=True)
 
 
-def _obtain_service_key() -> str:
-    """Interactive service-key entry: gh-style method menu on a TTY, then a
-    hidden prompt. Non-TTY (piped/CI) skips the menu and reads the key from
-    stdin, so `echo $KEY | nexla-cli login` still works."""
-    if sys.stdin.isatty():
-        _select_auth_method()
+def _obtain_service_key() -> str | None:
+    """Interactive credential entry. Returns the key, or None for browser SSO.
+
+    On a TTY the gh-style method menu runs first; picking browser sign-in
+    returns None so the caller runs the OAuth flow instead. Non-TTY (piped/CI)
+    skips the menu and reads the key from stdin, so
+    `echo $KEY | nexla-cli login` still works.
+    """
+    if sys.stdin.isatty() and _select_auth_method():
+        return None
     try:
         return str(typer.prompt("Nexla service key", hide_input=True, err=True))
     except (typer.Abort, EOFError):
@@ -88,27 +137,37 @@ def login(
             "and the stored bearer already auto-refreshes before it expires."
         ),
     ),
+    browser: bool = typer.Option(
+        False,
+        "--browser",
+        help="Sign in through the browser (OAuth loopback PKCE) instead of a service key",
+    ),
     no_store: bool = typer.Option(
         False,
         "--no-store",
         help="Don't persist credentials to the config file (print token only)",
     ),
 ) -> None:
-    """Exchange a service key for a bearer token.
+    """Exchange a service key -- or a browser sign-in -- for a bearer token.
 
     Prints the access token to stdout (so ``export NEXLA_TOKEN=$(nexla-cli
     login --service-key ...)`` still works); everything else (expiry, user,
     org, where credentials were stored) goes to stderr. Unless ``--no-store``,
-    the service key + bearer are saved to the config file so future commands
-    need no env var.
+    the bearer is saved to the config file so future commands need no env var.
     """
     if api_url:
         os.environ["NEXLA_API_URL"] = api_url
 
-    if service_key is None:
+    if service_key is None and not browser:
         service_key = _obtain_service_key()
+        browser = service_key is None  # menu picked browser sign-in
 
-    resp = client.request("POST", "/login", json={"service_key": service_key}, require_auth=False)
+    if browser:
+        resp = _browser_login()
+    else:
+        resp = client.request(
+            "POST", "/login", json={"service_key": service_key}, require_auth=False
+        )
     # The token itself is never sanitized -- it's a literal secret value that
     # must round-trip exactly for `export NEXLA_TOKEN=$(...)` to work.
     typer.echo(resp["access_token"])

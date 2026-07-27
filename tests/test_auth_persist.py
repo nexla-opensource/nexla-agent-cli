@@ -241,7 +241,8 @@ def test_select_auth_method_paste_returns(monkeypatch) -> None:
     from nexla_cli import login as login_module
 
     monkeypatch.setattr(login_module.typer, "prompt", lambda *a, **k: "1")
-    assert login_module._select_auth_method() is None
+    # False = "use a service key" (True would mean browser sign-in).
+    assert login_module._select_auth_method() is False
 
 
 def test_select_auth_method_browser_loops_until_available(monkeypatch, capsys) -> None:
