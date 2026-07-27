@@ -166,8 +166,22 @@ def pause(ctx: typer.Context, sink_id: int, dry_run: bool = DRY_RUN_OPT) -> None
 
 
 @app.command("delete")
-def delete(ctx: typer.Context, sink_id: int, dry_run: bool = DRY_RUN_OPT) -> None:
-    """Delete a sink."""
+def delete(
+    ctx: typer.Context,
+    sink_id: int,
+    force: bool = typer.Option(
+        False, "--force", help="Pause the sink first if it's active (delete requires it paused)."
+    ),
+    dry_run: bool = DRY_RUN_OPT,
+) -> None:
+    """Delete a sink.
+
+    The API refuses to delete an active sink; ``--force`` pauses it first so
+    one command does the whole job.
+    """
     if dry_run:
         dryrun.run_dry_run(resource="sinks", verb="delete", body={})
+    if force:
+        # Best-effort: a pause on an already-paused sink is a harmless no-op.
+        client.request("POST", f"/nexla/sinks/{sink_id}/pause")
     output.emit_delete(ctx, client.request("DELETE", f"/nexla/sinks/{sink_id}"), sink_id)
