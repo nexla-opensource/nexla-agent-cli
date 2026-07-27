@@ -23,7 +23,7 @@ from typing import Any
 
 import typer
 
-from .. import mcp_client, output
+from .. import client, mcp_client, output
 from ..errors import EXIT, CliError
 
 app = typer.Typer(
@@ -671,15 +671,21 @@ def _run_state(flow_id: int, run_id: int | None, log_size: int) -> dict[str, Any
         raise CliError(EXIT.NOT_FOUND, f"flow {flow_id} not found")
 
     eff_run_id = run_id or _latest_run_id(status)
-    if eff_run_id is None:
-        # Nothing has run yet -- the normal early state for a fresh source.
-        return {"state": "pending", "run_id": None, "flow_name": flow_name, "log_entries": []}
-
     health = _flow_health(status)
+    # Always look for ERROR logs, even with no run id in the status payload.
+    # The live server can report latest_run/recent_runs empty for a flow that
+    # has already run AND failed -- observed with 50 ERROR logs against a
+    # status showing no run at all. Short-circuiting to "pending" there made
+    # `watch` sit until timeout on an already-broken flow while `diagnose`
+    # correctly called it failed. Scope to the run when we know it.
     logs = _best_effort(
         "get_flow_logs", _args(flow_id=flow_id, run_id=eff_run_id, severity="ERROR", size=log_size)
     )
     entries = _log_entries(logs)
+
+    if eff_run_id is None and not entries and not _is_bad(health):
+        # Genuinely nothing yet -- the normal early state for a fresh source.
+        return {"state": "pending", "run_id": None, "flow_name": flow_name, "log_entries": []}
     failed = _is_bad(health) or bool(entries) or _in_error_oracle(flow_id)
     return {
         "state": "failed" if failed else "ok",
@@ -726,7 +732,23 @@ def watch(
 
     while True:
         polls += 1
-        last = _run_state(flow_id, run_id, log_size)
+        try:
+            last = _run_state(flow_id, run_id, log_size)
+        except CliError as e:
+            # A poll loop that runs for minutes must survive a blip: the
+            # monitoring server 503'd mid-watch during live testing and killed
+            # the whole command. Transient upstream failures are reported and
+            # retried until the timeout; anything else (a bad flow id, bad
+            # config) is a real error and still aborts immediately.
+            if e.code != EXIT.UPSTREAM:
+                raise
+            if mode not in ("json", "ndjson"):
+                waited = int(time.monotonic() - started)
+                typer.echo(f"[{waited}s] flow {flow_id}: monitoring unavailable, retrying", err=True)
+            if time.monotonic() - started + interval > timeout:
+                raise
+            time.sleep(interval)
+            continue
         state = last["state"]
         waited = int(time.monotonic() - started)
         if mode not in ("json", "ndjson"):
@@ -840,6 +862,35 @@ def _runs_of(status: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(seen.values(), key=lambda r: _sort_num(r["run_id"]), reverse=True)
 
 
+def _run_from_api(flow_id: int) -> list[dict[str, Any]]:
+    """The flow's ``last_run_id`` from the agent API, as a one-item run list.
+
+    Best-effort second opinion for :func:`runs` when the monitoring server
+    reports no history: ``GET /nexla/flows/{id}`` carries ``last_run_id`` even
+    when ``get_flow_status`` shows ``latest_run: null``.
+    """
+    try:
+        flow = client.request("GET", f"/nexla/flows/{flow_id}")
+    except CliError:
+        return []
+    if not isinstance(flow, dict):
+        return []
+    rid = flow.get("last_run_id")
+    if rid is None:
+        return []
+    return [
+        {
+            "run_id": rid,
+            "created_at": flow.get("updated_at"),
+            "data_source_id": (flow.get("source") or {}).get("id")
+            if isinstance(flow.get("source"), dict)
+            else None,
+            "latest": True,
+            "source": "agent-api",  # not from the monitoring history
+        }
+    ]
+
+
 @app.command("runs")
 def runs(
     ctx: typer.Context,
@@ -857,6 +908,12 @@ def runs(
     if not (status.get("flow_name") or status.get("name")) and not status.get("owner_email"):
         raise CliError(EXIT.NOT_FOUND, f"flow {flow_id} not found")
     found = _runs_of(status)[:limit]
+    if not found:
+        # The monitoring status payload can show no runs for a flow that has
+        # demonstrably run -- the agent API's own flow record still carries
+        # last_run_id. Fall back to it rather than claiming "no runs yet",
+        # which sends people looking for a run id that does exist.
+        found = _run_from_api(flow_id)
     mode = output.ctx_mode(ctx)
     if mode in ("json", "ndjson"):
         output.emit(found, mode=mode, fields=output.ctx_fields(ctx))

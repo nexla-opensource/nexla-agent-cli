@@ -9,7 +9,7 @@ import httpx
 import respx
 from typer.testing import CliRunner
 
-from .conftest import MONITORING_URL
+from .conftest import BASE_URL, MONITORING_URL
 
 
 def _sse(payload: dict) -> httpx.Response:
@@ -77,12 +77,56 @@ def test_runs_limit_caps(runner: CliRunner, cli_app, respx_mock: respx.MockRoute
 def test_runs_no_history_is_empty_not_error(
     runner: CliRunner, cli_app, respx_mock: respx.MockRouter
 ) -> None:
-    # A flow that has never run is a normal early state, not a failure.
+    # A flow that has never run is a normal early state, not a failure --
+    # neither the monitoring history nor the agent API knows of a run.
     respx_mock.post(f"{MONITORING_URL}/").mock(
         side_effect=_dispatch(
             {"get_flow_status": {"flow_id": 7, "flow_name": "f", "latest_run": None, "recent_runs": []}}
         )
     )
+    respx_mock.get(f"{BASE_URL}/nexla/flows/7").mock(
+        return_value=httpx.Response(200, json={"id": 7, "last_run_id": None})
+    )
+    result = runner.invoke(cli_app, ["triage", "runs", "7"])
+    assert result.exit_code == 0
+    assert jsonlib.loads(result.stdout) == []
+
+
+def test_runs_falls_back_to_agent_api_last_run_id(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+) -> None:
+    # Observed live: the monitoring status payload reported no runs for a flow
+    # that had demonstrably run, while the agent API's flow record still
+    # carried last_run_id. Claiming "no runs yet" sent people looking for a run
+    # id that does exist.
+    respx_mock.post(f"{MONITORING_URL}/").mock(
+        side_effect=_dispatch(
+            {"get_flow_status": {"flow_id": 7, "flow_name": "f", "latest_run": None, "recent_runs": []}}
+        )
+    )
+    respx_mock.get(f"{BASE_URL}/nexla/flows/7").mock(
+        return_value=httpx.Response(
+            200, json={"id": 7, "last_run_id": 1785165890053, "source": {"id": 42}}
+        )
+    )
+    result = runner.invoke(cli_app, ["triage", "runs", "7"])
+    assert result.exit_code == 0, result.output
+    data = jsonlib.loads(result.stdout)
+    assert [r["run_id"] for r in data] == [1785165890053]
+    assert data[0]["source"] == "agent-api"  # flagged as not monitoring history
+
+
+def test_runs_api_fallback_failure_is_not_fatal(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+) -> None:
+    # The fallback is best-effort: an API error degrades to "no runs", never
+    # turns a read-only query into a failure.
+    respx_mock.post(f"{MONITORING_URL}/").mock(
+        side_effect=_dispatch(
+            {"get_flow_status": {"flow_id": 7, "flow_name": "f", "latest_run": None, "recent_runs": []}}
+        )
+    )
+    respx_mock.get(f"{BASE_URL}/nexla/flows/7").mock(return_value=httpx.Response(500, json={}))
     result = runner.invoke(cli_app, ["triage", "runs", "7"])
     assert result.exit_code == 0
     assert jsonlib.loads(result.stdout) == []
