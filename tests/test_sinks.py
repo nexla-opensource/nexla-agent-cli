@@ -115,6 +115,54 @@ def test_delete(runner: CliRunner, cli_app, respx_mock: respx.MockRouter) -> Non
     assert "deleted" in result.stdout and "true" in result.stdout
 
 
+def test_delete_force_pauses_first(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+) -> None:
+    # --force pauses before deleting (the API refuses to delete an active sink).
+    pause = respx_mock.post(f"{BASE_URL}/nexla/sinks/1/pause").mock(
+        return_value=httpx.Response(200, json={"id": 1, "status": "PAUSED"})
+    )
+    delete = respx_mock.delete(f"{BASE_URL}/nexla/sinks/1").mock(return_value=httpx.Response(204))
+    result = runner.invoke(cli_app, ["sinks", "delete", "1", "--force"])
+    assert result.exit_code == 0
+    assert pause.called and delete.called
+    assert "deleted" in result.stdout
+
+
+def test_delete_without_force_does_not_pause(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+) -> None:
+    pause = respx_mock.post(f"{BASE_URL}/nexla/sinks/1/pause").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    respx_mock.delete(f"{BASE_URL}/nexla/sinks/1").mock(return_value=httpx.Response(204))
+    result = runner.invoke(cli_app, ["sinks", "delete", "1"])
+    assert result.exit_code == 0
+    assert not pause.called
+
+
+def test_delete_force_dry_run_fires_nothing(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter, monkeypatch
+) -> None:
+    """--dry-run -> no DELETE, and no pause either."""
+    monkeypatch.setattr("nexla_cli.dryrun.openapi_client.fetch_openapi", lambda: {"paths": {}})
+    monkeypatch.setattr(
+        "nexla_cli.dryrun.openapi_client.resolve",
+        lambda spec, resource, verb: {"operation": {}},
+    )
+    monkeypatch.setattr(
+        "nexla_cli.dryrun.openapi_client.request_body_schema", lambda spec, op: None
+    )
+    pause = respx_mock.post(f"{BASE_URL}/nexla/sinks/1/pause").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    delete = respx_mock.delete(f"{BASE_URL}/nexla/sinks/1").mock(return_value=httpx.Response(204))
+    result = runner.invoke(cli_app, ["sinks", "delete", "1", "--force", "--dry-run"])
+    assert result.exit_code == 0
+    assert not pause.called
+    assert not delete.called
+
+
 def test_upstream_500_maps_to_exit_6(runner: CliRunner, cli_app, respx_mock: respx.MockRouter) -> None:
     respx_mock.get(f"{BASE_URL}/nexla/sinks/1").mock(return_value=httpx.Response(500, text="boom"))
     result = runner.invoke(cli_app, ["sinks", "get", "1"])
