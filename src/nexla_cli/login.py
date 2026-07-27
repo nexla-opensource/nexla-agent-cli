@@ -92,6 +92,25 @@ def _select_auth_method() -> bool:
         typer.echo(f"invalid choice: {choice!r}", err=True)
 
 
+def _drain_tty() -> None:
+    """Discard input still queued on the terminal, if we're on one.
+
+    When a multi-line paste lands in a prompt, only the first line is read --
+    the rest stays in the tty buffer and, once this process exits, the shell
+    reads it as commands. That turns a mis-paste into arbitrary shell
+    execution, so flush the queue before bailing out. No-op when stdin isn't a
+    terminal (pipes have no such buffer) or on platforms without termios.
+    """
+    try:
+        import termios
+
+        if sys.stdin.isatty():
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        # Best-effort hardening: never let the cleanup path raise.
+        pass
+
+
 def _obtain_service_key() -> str | None:
     """Interactive credential entry. Returns the key, or None for browser SSO.
 
@@ -103,12 +122,14 @@ def _obtain_service_key() -> str | None:
     if sys.stdin.isatty() and _select_auth_method():
         return None
     try:
-        return str(typer.prompt("Nexla service key", hide_input=True, err=True))
+        raw = str(typer.prompt("Nexla service key", hide_input=True, err=True))
     except (typer.Abort, EOFError):
         if sys.stdin.isatty():
             # A real terminal: the user deliberately hit Ctrl-C/Ctrl-D. Let it
             # reach the top-level handler, which exits quietly (130). Telling
             # them to "run in an interactive terminal" here would be nonsense.
+            # Drain first: an aborted paste leaves lines the shell would run.
+            _drain_tty()
             raise
         # Non-interactive with nothing on stdin: this is a misconfiguration,
         # so say what to do about it.
@@ -117,6 +138,25 @@ def _obtain_service_key() -> str | None:
             "no service key provided; pass --service-key, pipe it on stdin, "
             "or run `nexla-cli login` in an interactive terminal",
         ) from None
+
+    # A pasted key routinely carries a trailing newline or stray spaces.
+    key = raw.strip()
+    if not key:
+        _drain_tty()
+        raise CliError(EXIT.VALIDATION, "no service key entered")
+    if any(c.isspace() for c in key):
+        # `hide_input` shows nothing, so a mis-paste (wrong clipboard, a whole
+        # block of text) is invisible until the server rejects it -- and the
+        # unread remainder then spills into the shell as commands. Reject it
+        # here, and drain what's still queued on the terminal.
+        _drain_tty()
+        raise CliError(
+            EXIT.VALIDATION,
+            "that doesn't look like a service key (it contains whitespace or "
+            "multiple lines) -- nothing was sent. Check what you pasted, or "
+            "use `nexla-cli login --service-key <key>`.",
+        )
+    return key
 
 
 def login(

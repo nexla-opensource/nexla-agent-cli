@@ -227,3 +227,63 @@ def test_non_tty_no_input_still_reports_misconfiguration(cli_app, monkeypatch) -
     result = CliRunner().invoke(cli_app, ["login"])
     assert result.exit_code == EXIT.CONFIG
     assert "no service key provided" in result.output
+
+
+def test_pasted_key_is_stripped(cli_app, respx_mock: respx.MockRouter, monkeypatch) -> None:
+    # A pasted key routinely carries a trailing newline/spaces.
+    from nexla_cli import login as login_module
+
+    monkeypatch.setenv("NEXLA_API_URL", BASE_URL)
+    monkeypatch.setattr(login_module, "_select_auth_method", lambda: False)
+    monkeypatch.setattr(login_module.typer, "prompt", lambda *a, **k: "  svc-key-123  ")
+    route = respx_mock.post(f"{BASE_URL}/login").mock(
+        return_value=httpx.Response(200, json=_MS_LOGIN_BODY)
+    )
+    result = CliRunner().invoke(cli_app, ["login"])
+    assert result.exit_code == 0, result.output
+    import json as jsonlib
+
+    assert jsonlib.loads(route.calls.last.request.content)["service_key"] == "svc-key-123"
+
+
+def test_multiline_paste_is_rejected_locally(
+    cli_app, respx_mock: respx.MockRouter, monkeypatch
+) -> None:
+    # `hide_input` hides a mis-paste, so a whitespace/multi-line blob must be
+    # caught HERE -- never sent upstream, and the tty queue drained so the
+    # unread remainder can't run as shell commands.
+    from nexla_cli import login as login_module
+
+    monkeypatch.setenv("NEXLA_API_URL", BASE_URL)
+    monkeypatch.setattr(login_module, "_select_auth_method", lambda: False)
+    monkeypatch.setattr(
+        login_module.typer, "prompt", lambda *a, **k: "line one of a traceback\nline two"
+    )
+    drained = {"n": 0}
+    monkeypatch.setattr(
+        login_module, "_drain_tty", lambda: drained.__setitem__("n", drained["n"] + 1)
+    )
+    route = respx_mock.post(f"{BASE_URL}/login")
+    result = CliRunner().invoke(cli_app, ["login"])
+    assert result.exit_code == EXIT.VALIDATION
+    assert not route.called  # nothing leaked upstream
+    assert drained["n"] == 1  # terminal queue flushed
+    assert "doesn't look like a service key" in result.output
+
+
+def test_empty_key_rejected(cli_app, monkeypatch) -> None:
+    from nexla_cli import login as login_module
+
+    monkeypatch.setenv("NEXLA_API_URL", BASE_URL)
+    monkeypatch.setattr(login_module, "_select_auth_method", lambda: False)
+    monkeypatch.setattr(login_module.typer, "prompt", lambda *a, **k: "   ")
+    monkeypatch.setattr(login_module, "_drain_tty", lambda: None)
+    result = CliRunner().invoke(cli_app, ["login"])
+    assert result.exit_code == EXIT.VALIDATION
+
+
+def test_drain_tty_is_safe_off_terminal(monkeypatch) -> None:
+    # Must never raise when stdin isn't a terminal (pipes/CI).
+    from nexla_cli import login as login_module
+
+    login_module._drain_tty()
