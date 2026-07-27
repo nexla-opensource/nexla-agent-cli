@@ -105,8 +105,13 @@ def _obtain_service_key() -> str | None:
     try:
         return str(typer.prompt("Nexla service key", hide_input=True, err=True))
     except (typer.Abort, EOFError):
-        # No TTY and nothing on stdin (or the user hit Ctrl-D/Ctrl-C): turn the
-        # abort into a clean, actionable error instead of a raw traceback.
+        if sys.stdin.isatty():
+            # A real terminal: the user deliberately hit Ctrl-C/Ctrl-D. Let it
+            # reach the top-level handler, which exits quietly (130). Telling
+            # them to "run in an interactive terminal" here would be nonsense.
+            raise
+        # Non-interactive with nothing on stdin: this is a misconfiguration,
+        # so say what to do about it.
         raise CliError(
             EXIT.CONFIG,
             "no service key provided; pass --service-key, pipe it on stdin, "

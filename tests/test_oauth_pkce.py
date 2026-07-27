@@ -173,3 +173,57 @@ def test_menu_offers_browser_only_when_client_id_set(monkeypatch) -> None:
     monkeypatch.setenv("NEXLA_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setattr(login_module.typer, "prompt", lambda *a, **k: "2")
     assert login_module._select_auth_method() is True
+
+
+def test_ctrl_c_at_menu_exits_quietly_not_traceback(cli_app, monkeypatch) -> None:
+    # Ctrl-C at the auth-method menu is a deliberate user action: exit 130
+    # (shell SIGINT convention) with a one-word notice, never a traceback.
+    from nexla_cli import login as login_module
+
+    monkeypatch.setenv("NEXLA_API_URL", BASE_URL)
+
+    def _abort(*a, **k):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(login_module.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(login_module.typer, "prompt", _abort)
+    result = CliRunner().invoke(cli_app, ["login"])
+    assert result.exit_code == 130
+    assert "Traceback" not in result.output
+    assert "aborted" in result.output
+
+
+def test_ctrl_c_at_key_prompt_exits_quietly(cli_app, monkeypatch) -> None:
+    # Same for the hidden key prompt -- and it must NOT be reported as the
+    # "no service key provided" misconfiguration error. (CliRunner swaps
+    # sys.stdin, so stub the menu directly rather than faking isatty.)
+    from nexla_cli import login as login_module
+
+    monkeypatch.setenv("NEXLA_API_URL", BASE_URL)
+    monkeypatch.setattr(login_module, "_select_auth_method", lambda: False)
+    monkeypatch.setattr(login_module.sys.stdin, "isatty", lambda: True)
+
+    def _abort(*a, **k):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(login_module.typer, "prompt", _abort)
+    result = CliRunner().invoke(cli_app, ["login"])
+    assert result.exit_code == 130
+    assert "Traceback" not in result.output
+    assert "no service key provided" not in result.output
+
+
+def test_non_tty_no_input_still_reports_misconfiguration(cli_app, monkeypatch) -> None:
+    # The non-interactive path keeps its actionable config error (exit 3).
+    from nexla_cli import login as login_module
+
+    monkeypatch.setenv("NEXLA_API_URL", BASE_URL)
+    monkeypatch.setattr(login_module.sys.stdin, "isatty", lambda: False)
+
+    def _abort(*a, **k):
+        raise login_module.typer.Abort()
+
+    monkeypatch.setattr(login_module.typer, "prompt", _abort)
+    result = CliRunner().invoke(cli_app, ["login"])
+    assert result.exit_code == EXIT.CONFIG
+    assert "no service key provided" in result.output
