@@ -65,14 +65,30 @@ def ctx_page_all(ctx: typer.Context) -> bool:
     return bool(obj.get("page_all"))
 
 
-def emit_delete(ctx: typer.Context, resp: Any, resource_id: int) -> None:
+def emit_delete(
+    ctx: typer.Context, resp: Any, resource_id: int, *, in_use_hint: str | None = None
+) -> None:
     """Emit a ``delete`` result honoring the active output mode.
 
     Delete endpoints vary: some echo the resulting object (e.g. a tool the
     backend soft-paused instead of removing), others return an empty ``204``.
     Show the real body when there is one; otherwise a ``{id, deleted}``
     confirmation — never a hardcoded plain-text line that ignores ``-o json``.
+
+    Some delete endpoints return HTTP 200 with an *error envelope* instead of
+    a non-2xx when the delete is refused (e.g. a credential still in use). A
+    truthy ``error`` on the body means it did NOT delete, so raise (non-zero
+    exit) instead of printing the error as if it were a success. ``in_use_hint``
+    lets a caller append a resource-specific next step (e.g. how to see
+    what's still using it).
     """
+    if isinstance(resp, dict) and resp.get("error"):
+        err = resp["error"]
+        detail = (err.get("detail") or err.get("error")) if isinstance(err, dict) else str(err)
+        msg = f"could not delete {resource_id}: {detail or 'resource still in use'}"
+        if in_use_hint:
+            msg = f"{msg}. {in_use_hint}"
+        raise CliError(EXIT.ERROR, msg, envelope=err if isinstance(err, dict) else None)
     emit(
         resp if isinstance(resp, dict) else {"id": resource_id, "deleted": True},
         mode=ctx_mode(ctx),
