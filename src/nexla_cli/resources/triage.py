@@ -15,6 +15,7 @@ raw-body passthrough here.
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -644,3 +645,144 @@ def diagnose(
     for rc in root_causes[1:]:
         res = f" ({rc['resource']})" if rc.get("resource") else ""
         typer.echo(f"  also: {rc['cause']}{res}; {rc['detail']}")
+
+
+# --- watch: block until a run reaches a terminal state ----------------------
+
+
+def _run_state(flow_id: int, run_id: int | None, log_size: int) -> dict[str, Any]:
+    """One poll: classify the flow's current run without judging by health alone.
+
+    Returns ``{state, run_id, flow_name, health, log_entries}`` where ``state``
+    is one of ``pending`` (no run has landed yet), ``failed``, or ``ok``.
+
+    Uses the same three signals as ``diagnose`` -- nested ``healthStatus``,
+    the presence of ERROR logs, and the errors oracle -- because the live
+    server leaves ``healthStatus`` null and ``affectedResources`` empty even
+    for genuinely RED flows.
+    """
+    status = mcp_client.call_tool("get_flow_status", _args(flow_id=flow_id, run_id=run_id))
+    if not isinstance(status, dict):
+        status = {"result": status}
+    flow_name = status.get("flow_name") or status.get("name")
+    if not flow_name and not status.get("owner_email"):
+        raise CliError(EXIT.NOT_FOUND, f"flow {flow_id} not found")
+
+    eff_run_id = run_id or _latest_run_id(status)
+    if eff_run_id is None:
+        # Nothing has run yet -- the normal early state for a fresh source.
+        return {"state": "pending", "run_id": None, "flow_name": flow_name, "log_entries": []}
+
+    health = _flow_health(status)
+    logs = _best_effort(
+        "get_flow_logs", _args(flow_id=flow_id, run_id=eff_run_id, severity="ERROR", size=log_size)
+    )
+    entries = _log_entries(logs)
+    failed = _is_bad(health) or bool(entries) or _in_error_oracle(flow_id)
+    return {
+        "state": "failed" if failed else "ok",
+        "run_id": eff_run_id,
+        "flow_name": flow_name,
+        "health": health,
+        "log_entries": entries,
+    }
+
+
+@app.command("watch")
+def watch(
+    ctx: typer.Context,
+    flow_id: int = _FLOW_ID_ARG,
+    until: str = typer.Option(
+        "any", help="Stop on: 'any' terminal state, only 'failed', or only 'complete'"
+    ),
+    timeout: int = typer.Option(600, help="Give up after this many seconds"),
+    interval: int = typer.Option(15, help="Seconds between polls"),
+    run_id: int | None = typer.Option(None, help="Watch a specific run instead of the latest"),
+    log_size: int = typer.Option(10, help="Max ERROR log entries to pull as evidence"),
+) -> None:
+    """Poll a flow until its run finishes, then report (and diagnose failures).
+
+    Fills the gap that otherwise forces a hand-rolled shell poll loop. A flow
+    with no run yet is *pending*, not failed -- a freshly created source can
+    take minutes to first run. Progress goes to stderr so stdout stays a single
+    parseable result.
+
+    Caveat worth knowing: the monitoring payload exposes no explicit "still
+    running" flag, so a run that has landed with no error signals is reported
+    complete. ``--until failed`` is the precise mode when you are waiting for a
+    failure specifically.
+    """
+    if until not in ("any", "failed", "complete"):
+        raise CliError(EXIT.VALIDATION, f"--until must be any|failed|complete, got {until!r}")
+    if interval <= 0 or timeout <= 0:
+        raise CliError(EXIT.VALIDATION, "--interval and --timeout must be positive")
+
+    mode = output.ctx_mode(ctx)
+    started = time.monotonic()
+    polls = 0
+    last: dict[str, Any] = {}
+
+    while True:
+        polls += 1
+        last = _run_state(flow_id, run_id, log_size)
+        state = last["state"]
+        waited = int(time.monotonic() - started)
+        if mode not in ("json", "ndjson"):
+            typer.echo(f"[{waited}s] flow {flow_id}: {state}", err=True)
+
+        done = (
+            (until == "any" and state in ("failed", "ok"))
+            or (until == "failed" and state == "failed")
+            or (until == "complete" and state == "ok")
+        )
+        if done:
+            break
+        if time.monotonic() - started + interval > timeout:
+            payload = {
+                "flow_id": flow_id,
+                "outcome": "timeout",
+                "waited_seconds": int(time.monotonic() - started),
+                "polls": polls,
+                "run_id": last.get("run_id"),
+                "last_state": state,
+            }
+            if mode in ("json", "ndjson"):
+                output.emit(payload, mode=mode, fields=output.ctx_fields(ctx))
+            else:
+                typer.echo(
+                    f"TIMEOUT: flow {flow_id} still {state} after {payload['waited_seconds']}s; "
+                    f"next: nexla-cli triage watch {flow_id} --timeout {timeout * 2}"
+                )
+            # Distinct from a flow failure: nothing is known to be broken, we
+            # simply stopped waiting.
+            raise typer.Exit(EXIT.ERROR)
+        time.sleep(interval)
+
+    outcome = "failed" if last["state"] == "failed" else "complete"
+    cause = ""
+    if outcome == "failed" and last["log_entries"]:
+        first = last["log_entries"][0]
+        cause = _summarize(_log_message(first))
+    payload = {
+        "flow_id": flow_id,
+        "outcome": outcome,
+        "waited_seconds": int(time.monotonic() - started),
+        "polls": polls,
+        "run_id": last.get("run_id"),
+        "cause": cause or None,
+        "next_commands": (
+            [f"nexla-cli triage diagnose {flow_id}"] if outcome == "failed" else []
+        ),
+    }
+    if mode in ("json", "ndjson"):
+        output.emit(payload, mode=mode, fields=output.ctx_fields(ctx))
+        return
+    label = f"flow {flow_id}" + (f" ({last['flow_name']})" if last.get("flow_name") else "")
+    if outcome == "failed":
+        detail = f"; {cause}" if cause else ""
+        typer.echo(
+            f"FAILED: {label} after {payload['waited_seconds']}s{detail}; "
+            f"next: nexla-cli triage diagnose {flow_id}"
+        )
+    else:
+        typer.echo(f"COMPLETE: {label} finished after {payload['waited_seconds']}s")
