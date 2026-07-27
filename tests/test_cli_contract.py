@@ -117,6 +117,7 @@ def test_json_mode_not_configured_emits_clean_json_envelope_on_stderr() -> None:
     assert proc.returncode == 3
     assert proc.stdout == ""
     envelope = jsonlib.loads(proc.stderr)
-    assert set(envelope) == {"error", "detail"}
+    assert {"error", "error_type", "detail"} <= set(envelope)
+    assert envelope["error_type"] == "config"
     assert envelope["detail"]
     _assert_no_traceback(proc)

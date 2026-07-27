@@ -249,3 +249,22 @@ def test_paginate_no_warning_when_not_truncated(
         items = list(client.paginate("/nexla/sources", per_page=100))
     assert len(items) == 1
     assert capsys.readouterr().err == ""
+
+
+def test_nested_detail_message_is_surfaced(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Real shape from e.g. `mcp-servers list` on a gateway-disabled toolset:
+    # detail is a dict carrying {code, message}. The readable message must win
+    # over the machine slug in `error`, so table mode isn't stuck on the slug.
+    monkeypatch.setenv("NEXLA_API_URL", BASE_URL)
+    monkeypatch.setenv("NEXLA_TOKEN", "t")
+    body = {
+        "detail": {
+            "error": "nexla.list_external_mcp_servers_failed",
+            "detail": {"code": "GATEWAY_DISABLED", "message": "MCP gateway is not enabled for this tool set"},
+        }
+    }
+    with respx.mock:
+        respx.get(f"{BASE_URL}/nexla/x").mock(return_value=httpx.Response(400, json=body))
+        with pytest.raises(CliError) as exc:
+            client.request("GET", "/nexla/x")
+    assert exc.value.message == "MCP gateway is not enabled for this tool set"

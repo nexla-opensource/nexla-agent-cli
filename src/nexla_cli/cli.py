@@ -177,11 +177,16 @@ def _wrap_cli_error[F: Callable[..., Any]](fn: F) -> F:
             if mode in ("json", "ndjson"):
                 envelope = {
                     "error": sanitize(e.envelope),
+                    "error_type": e.error_type,
                     "detail": sanitize(e.message),
                 }
+                if e.hint:
+                    envelope["hint"] = sanitize(e.hint)
                 typer.echo(jsonlib.dumps(envelope, default=str), err=True)
             else:
                 typer.echo(f"error: {sanitize(e.message)}", err=True)
+                if e.hint:
+                    typer.echo(f"hint: {sanitize(e.hint)}", err=True)
             raise typer.Exit(e.code) from e
 
     return wrapper  # type: ignore[return-value]

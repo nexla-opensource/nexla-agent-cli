@@ -23,7 +23,12 @@ from .errors import EXIT, CliError
 def _base() -> str:
     url = os.environ.get("NEXLA_API_URL")
     if not url:
-        raise CliError(EXIT.CONFIG, "NEXLA_API_URL is not set")
+        raise CliError(
+            EXIT.CONFIG,
+            "NEXLA_API_URL is not set",
+            hint="set NEXLA_API_URL to your deployed Nexla agent API, "
+            "or pass --api-url",
+        )
     return url.rstrip("/")
 
 
@@ -44,7 +49,12 @@ def timeout() -> float:
 def _token() -> str:
     tok = os.environ.get("NEXLA_TOKEN")
     if not tok:
-        raise CliError(EXIT.CONFIG, "NEXLA_TOKEN is not set")
+        raise CliError(
+            EXIT.CONFIG,
+            "NEXLA_TOKEN is not set",
+            hint="run `nexla-cli login --service-key <key>` and export the "
+            "printed token as NEXLA_TOKEN",
+        )
     return tok
 
 
@@ -78,6 +88,14 @@ def _message_from_envelope(envelope: dict[str, Any], *, fallback: str) -> str:
         val = envelope.get(key)
         if isinstance(val, str) and val:
             return val
+        # Some routes nest a richer error under detail, e.g.
+        # {"error": "nexla.x_failed", "detail": {"code": ..., "message": ...}}.
+        # Prefer the human-readable message over the machine code so table
+        # mode isn't stuck showing the bare `nexla.x_failed` slug.
+        if isinstance(val, dict):
+            nested = val.get("message") or val.get("detail")
+            if isinstance(nested, str) and nested:
+                return nested
     return fallback
 
 
