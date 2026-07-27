@@ -14,6 +14,7 @@ import contextlib
 import os
 import sys
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import typer
@@ -90,6 +91,42 @@ def _select_auth_method() -> bool:
             )
             continue
         typer.echo(f"invalid choice: {choice!r}", err=True)
+
+
+def _stdout_is_tty() -> bool:
+    """Whether stdout is a terminal (vs a pipe/redirect being captured)."""
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _tilde(path: Any) -> str:
+    """Abbreviate the user's home directory, the way a shell prints it."""
+    text = str(path)
+    home = os.path.expanduser("~")
+    return f"~{text[len(home):]}" if home != "/" and text.startswith(home) else text
+
+
+def _expiry_phrase(expires_at: Any) -> str:
+    """Render a unix expiry as an absolute UTC time plus a relative hint.
+
+    A bare epoch integer tells a human nothing; `expires_at=1785419348` was
+    the old output. Falls back to the raw value if it isn't a timestamp.
+    """
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+        return str(expires_at)
+    when = datetime.fromtimestamp(expires_at, tz=UTC)
+    remaining = int(expires_at - time.time())
+    if remaining <= 0:
+        rel = "expired"
+    elif remaining < 3600:
+        rel = f"in {remaining // 60}m"
+    elif remaining < 86400:
+        rel = f"in {remaining // 3600}h"
+    else:
+        rel = f"in {remaining // 86400}d"
+    return f"{when:%Y-%m-%d %H:%M UTC} ({rel})"
 
 
 def _drain_tty() -> None:
@@ -213,15 +250,26 @@ def login(
         resp = client.request(
             "POST", "/login", json={"service_key": service_key}, require_auth=False
         )
-    # The token itself is never sanitized -- it's a literal secret value that
-    # must round-trip exactly for `export NEXLA_TOKEN=$(...)` to work.
-    typer.echo(resp["access_token"])
     user = sanitize(resp["user"])
     org = sanitize(resp["org"])
-    typer.echo(
-        f"expires_at={resp['expires_at']} user={user['email']} org={org['name']}",
-        err=True,
-    )
+
+    # Print the raw bearer only when stdout is being captured (a pipe or
+    # redirect), which is exactly the `export NEXLA_TOKEN=$(nexla-cli login
+    # ...)` case -- command substitution gives us a pipe, never a tty. On a
+    # real terminal, dumping a JWT just parks a live secret in the user's
+    # scrollback for no benefit, since it was persisted anyway. `--no-store`
+    # is the exception: nothing is saved, so the token IS the deliverable.
+    show_token = no_store or not _stdout_is_tty()
+    if show_token:
+        # Never sanitized -- a literal secret that must round-trip exactly.
+        typer.echo(resp["access_token"])
+        typer.echo(
+            f"expires_at={resp['expires_at']} user={user['email']} org={org['name']}",
+            err=True,
+        )
+    else:
+        typer.echo(f"Logged in as {user['email']} ({org['name']})", err=True)
+        typer.echo(f"  expires  {_expiry_phrase(resp.get('expires_at'))}", err=True)
 
     if not no_store:
         # Store the *effective* base URL (flag > env) alongside the secret so a
@@ -237,7 +285,14 @@ def login(
             user_email=user.get("email"),  # for `whoami`
             org_name=org.get("name"),
         )
-        typer.echo(f"credentials stored at {saved} (use --no-store to skip)", err=True)
+        if show_token:
+            typer.echo(f"credentials stored at {saved} (use --no-store to skip)", err=True)
+        else:
+            typer.echo(f"  stored   {_tilde(saved)}", err=True)
+            typer.echo(
+                "  token    kept in the config file; `nexla-cli whoami` shows the session",
+                err=True,
+            )
 
 
 def logout() -> None:
