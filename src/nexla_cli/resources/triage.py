@@ -15,6 +15,8 @@ raw-body passthrough here.
 
 from __future__ import annotations
 
+import importlib
+import os
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -786,3 +788,304 @@ def watch(
         )
     else:
         typer.echo(f"COMPLETE: {label} finished after {payload['waited_seconds']}s")
+
+
+# --- discovery + board commands ---------------------------------------------
+
+
+def _sort_num(value: Any) -> float:
+    """Coerce a value to a float sort key, unorderable input sorting last.
+
+    Ranking keys off an untrusted payload (run ids, error counts) must never
+    raise: Python 3 refuses to compare str with int, so one drifted field
+    would crash the command with a raw traceback.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def _runs_of(status: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every known run for a flow, newest first, latest flagged.
+
+    ``recent_runs`` is the history; ``latest_run`` is sometimes populated when
+    the history is not, so merge both and de-duplicate on ``run_id``.
+    """
+    seen: dict[Any, dict[str, Any]] = {}
+    latest = status.get("latest_run")
+    latest_id = latest.get("run_id") if isinstance(latest, dict) else None
+    candidates: list[Any] = []
+    if isinstance(latest, dict):
+        candidates.append(latest)
+    recent = status.get("recent_runs")
+    if isinstance(recent, list):
+        candidates.extend(recent)
+    for r in candidates:
+        if not isinstance(r, dict):
+            continue
+        rid = r.get("run_id")
+        if rid is None or rid in seen:
+            continue
+        seen[rid] = {
+            "run_id": rid,
+            "created_at": r.get("created_at"),
+            "data_source_id": r.get("data_source_id"),
+            "latest": rid == latest_id,
+        }
+    # Run ids are monotonic epoch-millis on this server, so sorting by id gives
+    # newest-first even when created_at is missing. Sort through `_sort_num` so
+    # a non-numeric id from schema drift degrades the ORDER instead of raising
+    # an uncaught TypeError (mixed str/int is unorderable in Python 3).
+    return sorted(seen.values(), key=lambda r: _sort_num(r["run_id"]), reverse=True)
+
+
+@app.command("runs")
+def runs(
+    ctx: typer.Context,
+    flow_id: int = _FLOW_ID_ARG,
+    limit: int = typer.Option(10, help="Max runs returned (newest first)"),
+) -> None:
+    """List a flow's recent run ids -- the input `triage run` needs.
+
+    ``triage run`` requires a run id you already know; nothing surfaced one.
+    A flow that has never run yields an empty list, not an error.
+    """
+    status = mcp_client.call_tool("get_flow_status", _args(flow_id=flow_id))
+    if not isinstance(status, dict):
+        status = {"result": status}
+    if not (status.get("flow_name") or status.get("name")) and not status.get("owner_email"):
+        raise CliError(EXIT.NOT_FOUND, f"flow {flow_id} not found")
+    found = _runs_of(status)[:limit]
+    mode = output.ctx_mode(ctx)
+    if mode in ("json", "ndjson"):
+        output.emit(found, mode=mode, fields=output.ctx_fields(ctx))
+        return
+    if not found:
+        typer.echo(f"no runs yet for flow {flow_id}")
+        return
+    for r in found:
+        mark = " (latest)" if r["latest"] else ""
+        typer.echo(f"{r['run_id']}  {r.get('created_at') or '-'}{mark}")
+    typer.echo(f"next: nexla-cli triage run {flow_id} {found[0]['run_id']}", err=True)
+
+
+@app.command("flow-quarantine")
+def flow_quarantine(
+    ctx: typer.Context,
+    flow_id: int = _FLOW_ID_ARG,
+    sample_size: int = typer.Option(5, help="Max rejected records sampled per resource"),
+    log_size: int = typer.Option(10, help="Max ERROR log entries used to find the resource"),
+) -> None:
+    """Quarantined records for a whole flow -- resolves the failing resource itself.
+
+    ``triage quarantine`` needs ``--resource-type``/``--resource-id``, which is
+    exactly what you don't know yet. This finds the errored resource the same
+    way ``diagnose`` does (ERROR log attribution, falling back to
+    ``status.affectedResources``) and samples each one. A left-alone sibling
+    command so the existing ``quarantine`` contract stays intact.
+    """
+    status = mcp_client.call_tool("get_flow_status", _args(flow_id=flow_id))
+    if not isinstance(status, dict):
+        status = {"result": status}
+    if not (status.get("flow_name") or status.get("name")) and not status.get("owner_email"):
+        raise CliError(EXIT.NOT_FOUND, f"flow {flow_id} not found")
+
+    logs = _best_effort(
+        "get_flow_logs",
+        _args(flow_id=flow_id, run_id=_latest_run_id(status), severity="ERROR", size=log_size),
+    )
+    resources = [
+        r
+        for r in _resources_from_logs(_log_entries(logs))
+        if r["resource_type"] is not None and r["resource_id"] is not None
+    ]
+    if not resources:
+        resources = [r for r in _affected_resources(status) if r["resource_id"] is not None]
+
+    out: list[dict[str, Any]] = []
+    for r in resources:
+        rt, rid = r["resource_type"], r["resource_id"]
+        samples = _quarantine_samples(
+            _best_effort(
+                "get_quarantine_samples",
+                _args(resource_type=rt, resource_id=rid, sample_size=sample_size),
+            )
+        )
+        out.append(
+            {
+                "resource_type": rt,
+                "resource_id": rid,
+                "sample_count": len(samples),
+                "reason": _summarize(_quarantine_reason(samples[0])) if samples else None,
+                "samples": samples,
+            }
+        )
+
+    mode = output.ctx_mode(ctx)
+    if mode in ("json", "ndjson"):
+        output.emit(out, mode=mode, fields=output.ctx_fields(ctx))
+        return
+    if not out:
+        typer.echo(f"no errored resources found for flow {flow_id}")
+        return
+    for entry in out:
+        head = f"{entry['resource_type']} {entry['resource_id']}: {entry['sample_count']} sample(s)"
+        typer.echo(f"{head}{'; ' + entry['reason'] if entry['reason'] else ''}")
+
+
+@app.command("summary")
+def summary(
+    ctx: typer.Context,
+    top: int = typer.Option(5, help="How many worst flows to list"),
+    from_date: str | None = typer.Option(None, help="YYYY-MM-DD, UTC, inclusive"),
+    since: str | None = _SINCE_OPT,
+) -> None:
+    """One-screen health board: org totals + the worst flows right now.
+
+    Every upstream call is best-effort, so one flaky tool degrades the board
+    instead of sinking it -- what was unavailable is reported. Defaults to the
+    server's own window: wider windows can time out server-side.
+    """
+    resolved = _from_date(from_date, since)
+    errors_payload = _best_effort("list_flows_with_errors", _args(from_date=resolved))
+    org = _best_effort("get_org_metrics", _args(from_date=resolved))
+
+    flows = errors_payload.get("flows") if isinstance(errors_payload, dict) else None
+    flows = flows if isinstance(flows, list) else []
+    ranked = sorted(
+        (f for f in flows if isinstance(f, dict)),
+        key=lambda f: _sort_num(f.get("errors")),
+        reverse=True,
+    )[:top]
+    worst = [
+        {
+            "flow_id": f.get("flow_id"),
+            "flow_name": f.get("flow_name"),
+            "errors": f.get("errors"),
+            "last_run_status": f.get("last_run_status"),
+        }
+        for f in ranked
+    ]
+    unavailable = [
+        name
+        for name, payload in (("list_flows_with_errors", errors_payload), ("get_org_metrics", org))
+        if not payload
+    ]
+    payload = {
+        "window": errors_payload.get("window") if isinstance(errors_payload, dict) else None,
+        "flows_with_errors": errors_payload.get("count") if isinstance(errors_payload, dict) else None,
+        "org_metrics": org or None,
+        "worst_flows": worst,
+        "unavailable": unavailable,
+        "next_commands": (
+            [f"nexla-cli triage diagnose {worst[0]['flow_id']}"] if worst else []
+        ),
+    }
+    mode = output.ctx_mode(ctx)
+    if mode in ("json", "ndjson"):
+        output.emit(payload, mode=mode, fields=output.ctx_fields(ctx))
+        return
+    typer.echo(f"flows with errors: {payload['flows_with_errors']}")
+    for f in worst:
+        typer.echo(
+            f"  {f['flow_id']}  errors={f['errors']}  {f['last_run_status'] or ''}  "
+            f"{f['flow_name'] or ''}".rstrip()
+        )
+    if unavailable:
+        typer.echo(f"unavailable: {', '.join(unavailable)}", err=True)
+    if worst:
+        typer.echo(f"next: nexla-cli triage diagnose {worst[0]['flow_id']}", err=True)
+
+
+@app.command("doctor")
+def doctor(ctx: typer.Context) -> None:
+    """Check this CLI's own configuration and connectivity, with fixes.
+
+    Reports where each setting came from (env vs stored config) and whether
+    the monitoring server answers. Never prints a token value -- only whether
+    one is present and its source.
+    """
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, ok: bool, detail: str, hint: str = "", critical: bool = True) -> None:
+        checks.append(
+            {"check": name, "ok": ok, "detail": detail, "hint": hint or None, "critical": critical}
+        )
+
+    stored = _stored_config()
+    api = os.environ.get("NEXLA_API_URL") or stored.get("api_url")
+    add(
+        "api_url",
+        bool(api),
+        f"{api} (from {'env' if os.environ.get('NEXLA_API_URL') else 'config'})" if api else "not set",
+        "set NEXLA_API_URL or run `nexla-cli login --api-url ...`",
+    )
+    token_env = bool(os.environ.get("NEXLA_TOKEN"))
+    has_token = token_env or bool(stored.get("access_token"))
+    add(
+        "auth",
+        has_token,
+        f"token present (from {'env' if token_env else 'config'})" if has_token else "no token",
+        "run `nexla-cli login`",
+    )
+    mon = os.environ.get("NEXLA_MONITORING_URL") or stored.get("monitoring_url")
+    add(
+        "monitoring_url",
+        bool(mon),
+        f"{mon} (from {'env' if os.environ.get('NEXLA_MONITORING_URL') else 'config'})"
+        if mon
+        else "not set -- `triage` commands will not work",
+        "set NEXLA_MONITORING_URL or run `nexla-cli login --monitoring-url ...`",
+        critical=False,
+    )
+    if mon:
+        tools = _best_effort_call(lambda: mcp_client.list_tools())
+        n = len(tools) if isinstance(tools, list) else 0
+        add(
+            "monitoring_reachable",
+            n > 0,
+            f"{n} tool(s) advertised" if n else "no response from the monitoring server",
+            "check NEXLA_MONITORING_URL and that your token is valid",
+            critical=False,
+        )
+
+    mode = output.ctx_mode(ctx)
+    failed_critical = [c for c in checks if c["critical"] and not c["ok"]]
+    if mode in ("json", "ndjson"):
+        output.emit(
+            {"checks": checks, "ok": not failed_critical},
+            mode=mode,
+            fields=output.ctx_fields(ctx),
+        )
+    else:
+        for c in checks:
+            typer.echo(f"{'PASS' if c['ok'] else 'FAIL'}  {c['check']}: {c['detail']}")
+            if not c["ok"] and c["hint"]:
+                typer.echo(f"      fix: {c['hint']}")
+    if failed_critical:
+        raise typer.Exit(EXIT.CONFIG)
+
+
+def _stored_config() -> dict[str, Any]:
+    """The persisted login config, or {} when this build has no store.
+
+    `config.py` arrives with the credential-persistence work; importing it
+    defensively keeps `doctor` correct both before and after that lands
+    (reporting a config-sourced setting as "not set" would be a lie).
+    """
+    try:
+        # Dynamic: the module may legitimately not exist in this build yet.
+        config = importlib.import_module("nexla_cli.config")
+    except ImportError:
+        return {}
+    loaded = config.load()
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _best_effort_call(fn: Any) -> Any:
+    """Run a callable, treating any CliError as 'no data' (doctor probes)."""
+    try:
+        return fn()
+    except CliError:
+        return None
