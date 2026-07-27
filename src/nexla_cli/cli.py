@@ -41,6 +41,7 @@ try:
 except ImportError:  # pragma: no cover - depends on which Typer is installed
     from typer._click.exceptions import NoArgsIsHelpError, UsageError
 
+from . import helptext
 from . import login as login_module
 from . import output as output_module
 from .errors import CliError
@@ -188,9 +189,15 @@ def _wrap_cli_error[F: Callable[..., Any]](fn: F) -> F:
 
 
 def _wrap_app_commands(sub_app: typer.Typer) -> None:
+    group = sub_app.info.name
     for cmd_info in sub_app.registered_commands:
         if cmd_info.callback is not None:
             cmd_info.callback = _wrap_cli_error(cmd_info.callback)
+        # Attach the curated EXAMPLES epilog, if this command has one. Set
+        # here rather than as an `@app.command(epilog=...)` argument so the
+        # help text all lives in `helptext` instead of being sprinkled
+        # across 17 resource modules.
+        cmd_info.epilog = helptext.EXAMPLES.get(f"{group} {cmd_info.name}", cmd_info.epilog)
     # `schema_app` has no `registered_commands` at all -- its only
     # entry point is a `@schema_app.callback(invoke_without_command=True)`,
     # which Typer stores separately as `registered_callback`. Wrap that too
@@ -204,6 +211,7 @@ app = typer.Typer(
     name="nexla-cli",
     no_args_is_help=True,
     help="Nexla agent CLI. Set NEXLA_API_URL and NEXLA_TOKEN.",
+    epilog=helptext.ROOT_EPILOG,
 )
 
 
@@ -237,8 +245,6 @@ def _root(
     }
 
 
-app.command("login")(_wrap_cli_error(login_module.login))
-
 for _mod in (
     sources,
     sinks,
@@ -257,7 +263,10 @@ for _mod in (
     skill,
 ):
     _wrap_app_commands(_mod.app)
-    app.add_typer(_mod.app)
+    # `rich_help_panel` splits the root help's flat command list into
+    # gh-style sections (see `helptext.PANELS`); a group absent from the
+    # map lands in Typer's default "Commands" panel.
+    app.add_typer(_mod.app, rich_help_panel=helptext.PANELS.get(_mod.app.info.name or ""))
 
 # Not-implemented-in-v1 command groups: registered so `python -m nexla_cli
 # <group>` still resolves (and fails with a clear local message), but hidden
@@ -267,8 +276,17 @@ for _stub in (code_containers, metrics, users, notifications):
     _wrap_app_commands(_stub.app)
     app.add_typer(_stub.app, hidden=True)
 
+app.command(
+    "login",
+    rich_help_panel=helptext.PANELS["login"],
+    epilog=helptext.EXAMPLES["login"],
+)(_wrap_cli_error(login_module.login))
+
 _wrap_app_commands(schema_app)
-app.add_typer(schema_app)
+# `schema` is callback-only (no `registered_commands`), so its epilog goes
+# on the sub-app itself rather than through `_wrap_app_commands`.
+schema_app.info.epilog = helptext.EXAMPLES["schema"]
+app.add_typer(schema_app, rich_help_panel=helptext.PANELS["schema"])
 
 
 def _reorder_global_flags(argv: list[str]) -> list[str]:

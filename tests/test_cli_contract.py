@@ -59,6 +59,23 @@ def test_help_exits_zero_with_help_on_stdout_and_empty_stderr() -> None:
     _assert_no_traceback(proc)
 
 
+def test_help_sections_and_examples_stay_on_stdout() -> None:
+    """The gh-style sections and the EXAMPLES epilogs are part of the help
+    *contract*, not decoration: they must render through the real
+    entrypoint, on STDOUT, with STDERR still empty."""
+    root = _run("--help")
+    assert root.returncode == 0
+    assert root.stderr == ""
+    assert "Core resources" in root.stdout
+    assert "EXIT CODES" in root.stdout
+
+    cmd = _run("sources", "create", "--help")
+    assert cmd.returncode == 0
+    assert cmd.stderr == ""
+    assert "EXAMPLES" in cmd.stdout
+    _assert_no_traceback(cmd)
+
+
 def test_no_args_prints_help_to_stdout() -> None:
     """Bare `nexla-cli` is `no_args_is_help=True`: help goes to STDOUT (so a
     script piping it sees it), stderr stays empty, no traceback. This
