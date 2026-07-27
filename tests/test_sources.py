@@ -233,6 +233,32 @@ def test_delete(runner: CliRunner, cli_app, respx_mock: respx.MockRouter) -> Non
     assert "deleted" in result.stdout and "true" in result.stdout
 
 
+def test_delete_force_pauses_first(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+) -> None:
+    # --force pauses before deleting (the API refuses to delete an active source).
+    pause = respx_mock.post(f"{BASE_URL}/nexla/sources/1/pause").mock(
+        return_value=httpx.Response(200, json={"id": 1, "status": "PAUSED"})
+    )
+    delete = respx_mock.delete(f"{BASE_URL}/nexla/sources/1").mock(return_value=httpx.Response(204))
+    result = runner.invoke(cli_app, ["sources", "delete", "1", "--force"])
+    assert result.exit_code == 0
+    assert pause.called and delete.called
+    assert "deleted" in result.stdout
+
+
+def test_delete_without_force_does_not_pause(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+) -> None:
+    pause = respx_mock.post(f"{BASE_URL}/nexla/sources/1/pause").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    respx_mock.delete(f"{BASE_URL}/nexla/sources/1").mock(return_value=httpx.Response(204))
+    result = runner.invoke(cli_app, ["sources", "delete", "1"])
+    assert result.exit_code == 0
+    assert not pause.called
+
+
 def test_sample(runner: CliRunner, cli_app, respx_mock: respx.MockRouter) -> None:
     route = respx_mock.post(f"{BASE_URL}/nexla/sources/1/sample").mock(
         return_value=httpx.Response(200, json={"dataset_id": 9, "processed": 1})

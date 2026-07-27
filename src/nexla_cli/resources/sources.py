@@ -262,10 +262,24 @@ def pause(ctx: typer.Context, source_id: int, dry_run: bool = DRY_RUN_OPT) -> No
 
 
 @app.command("delete")
-def delete(ctx: typer.Context, source_id: int, dry_run: bool = DRY_RUN_OPT) -> None:
-    """Delete a source."""
+def delete(
+    ctx: typer.Context,
+    source_id: int,
+    force: bool = typer.Option(
+        False, "--force", help="Pause the source first if it's active (delete requires it paused)."
+    ),
+    dry_run: bool = DRY_RUN_OPT,
+) -> None:
+    """Delete a source.
+
+    The API refuses to delete an active source; ``--force`` pauses it first so
+    one command does the whole job.
+    """
     if dry_run:
         dryrun.run_dry_run(resource="sources", verb="delete", body={})
+    if force:
+        # Best-effort: a pause on an already-paused source is a harmless no-op.
+        client.request("POST", f"/nexla/sources/{source_id}/pause")
     output.emit_delete(ctx, client.request("DELETE", f"/nexla/sources/{source_id}"), source_id)
 
 
