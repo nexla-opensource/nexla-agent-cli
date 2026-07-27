@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+
 import pytest
 import respx
 from typer.testing import CliRunner
@@ -228,3 +230,55 @@ def test_passthrough_json_and_params_merge_into_request_body(
     assert sent["name"] == "x"
     assert sent["connector"] == "s3"
     assert sent["description"] == "from-json"
+
+
+# ---- @file / @- JSON payload sourcing ---------------------------------------
+
+
+def test_parse_json_arg_at_file_reads_the_file(tmp_path) -> None:
+    body = tmp_path / "body.json"
+    body.write_text('{"a": 1}')
+    assert validate.parse_json_arg("config", f"@{body}") == {"a": 1}
+
+
+def test_parse_json_arg_at_dash_reads_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"from": "stdin"}'))
+    assert validate.parse_json_arg("json", "@-") == {"from": "stdin"}
+
+
+def test_parse_json_arg_at_missing_file_is_validation_error(tmp_path) -> None:
+    with pytest.raises(CliError) as exc:
+        validate.parse_json_arg("config", f"@{tmp_path / 'nope.json'}")
+    assert exc.value.code == EXIT.VALIDATION
+    assert "cannot read" in str(exc.value)
+
+
+def test_parse_json_arg_at_file_with_invalid_json_is_validation_error(tmp_path) -> None:
+    body = tmp_path / "bad.json"
+    body.write_text("{not json")
+    with pytest.raises(CliError) as exc:
+        validate.parse_json_arg("config", f"@{body}")
+    assert exc.value.code == EXIT.VALIDATION
+    assert "--config is not valid JSON" in str(exc.value)
+
+
+def test_parse_json_arg_inline_json_is_unchanged() -> None:
+    # The `@` prefix is positional-only: literal JSON never starts with it.
+    assert validate.parse_json_arg("config", '{"@weird": "@notafile"}') == {"@weird": "@notafile"}
+
+
+def test_build_body_json_accepts_at_file(tmp_path) -> None:
+    body = tmp_path / "b.json"
+    body.write_text('{"name": "from-file"}')
+    assert validate.build_body({}, f"@{body}", []) == {"name": "from-file"}
+
+
+def test_build_body_named_still_beats_at_file_json(tmp_path) -> None:
+    # `@file` only changes where the --json text comes from, never the
+    # named > --json > --params precedence.
+    body = tmp_path / "b.json"
+    body.write_text('{"name": "from-file", "keep": 1}')
+    assert validate.build_body({"name": "named"}, f"@{body}", ["name=param"]) == {
+        "name": "named",
+        "keep": 1,
+    }

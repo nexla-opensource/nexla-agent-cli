@@ -356,3 +356,73 @@ def test_list_page_all_forwards_filters_across_pages(
 def test_missing_env_maps_to_config_exit(cli_app) -> None:
     result = CliRunner().invoke(cli_app, ["sources", "list"], env={"NEXLA_API_URL": "", "NEXLA_TOKEN": ""})
     assert result.exit_code == 3  # EXIT.CONFIG
+
+
+# ---- @file / @- payload sourcing (CLI level) --------------------------------
+
+
+def test_create_json_at_file(runner: CliRunner, cli_app, respx_mock: respx.MockRouter, tmp_path):
+    """`--json @file` must build the same body as inline JSON."""
+    body_file = tmp_path / "src.json"
+    body_file.write_text(jsonlib.dumps({"extra": "from-file", "connector": "webhook"}))
+    respx_mock.post(f"{BASE_URL}/nexla/sources").mock(
+        return_value=httpx.Response(201, json={"id": 9, "name": "from-file"})
+    )
+    result = runner.invoke(
+        cli_app,
+        ["sources", "create", "--name", "x", "--connector", "webhook", "--json", f"@{body_file}"],
+    )
+    assert result.exit_code == 0
+    sent = jsonlib.loads(respx_mock.calls.last.request.content)
+    assert sent["extra"] == "from-file"  # came from the file
+    assert sent["name"] == "x"  # named option still outranks --json
+
+
+def test_sample_payload_at_dash_reads_stdin(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter
+):
+    respx_mock.post(f"{BASE_URL}/nexla/sources/1/sample").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    result = runner.invoke(
+        cli_app, ["sources", "sample", "1", "--payload", "@-"], input='{"k": "v"}'
+    )
+    assert result.exit_code == 0
+    assert jsonlib.loads(respx_mock.calls.last.request.content) == {"payload": {"k": "v"}}
+
+
+def test_create_json_at_missing_file_exits_validation(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter, tmp_path
+):
+    route = respx_mock.post(f"{BASE_URL}/nexla/sources")
+    result = runner.invoke(
+        cli_app,
+        [
+            "sources",
+            "create",
+            "--name",
+            "x",
+            "--connector",
+            "webhook",
+            "--json",
+            f"@{tmp_path / 'missing.json'}",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "cannot read" in result.stderr
+    assert not route.called
+
+
+def test_create_config_at_file_invalid_json_exits_validation(
+    runner: CliRunner, cli_app, respx_mock: respx.MockRouter, tmp_path
+):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{oops")
+    route = respx_mock.post(f"{BASE_URL}/nexla/sources")
+    result = runner.invoke(
+        cli_app,
+        ["sources", "create", "--name", "x", "--connector", "webhook", "--config", f"@{bad}"],
+    )
+    assert result.exit_code == 2
+    assert "--config is not valid JSON" in result.stderr
+    assert not route.called

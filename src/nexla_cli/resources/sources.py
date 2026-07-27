@@ -163,7 +163,9 @@ def create(
     credential_id: int | None = typer.Option(None),
     endpoint: str | None = typer.Option(None),
     mode: str | None = typer.Option(None, help="db connectors only: 'default' or 'query'"),
-    config: str = typer.Option("{}", help="JSON object of connector-specific fields"),
+    config: str = typer.Option(
+        "{}", help="JSON object of connector-specific fields; accepts @file.json or @-"
+    ),
     schedule: str = typer.Option("recurring", help="'recurring' or 'once'"),
     json_body: str | None = JSON_OPT,
     params: list[str] = PARAMS_OPT,
@@ -200,7 +202,7 @@ def update(
     source_id: int,
     name: str | None = typer.Option(None),
     description: str | None = typer.Option(None),
-    config: str | None = typer.Option(None, help="JSON object"),
+    config: str | None = typer.Option(None, help="JSON object; accepts @file.json or @-"),
     json_body: str | None = JSON_OPT,
     params: list[str] = PARAMS_OPT,
     dry_run: bool = DRY_RUN_OPT,
@@ -273,7 +275,7 @@ def delete(ctx: typer.Context, source_id: int, dry_run: bool = DRY_RUN_OPT) -> N
 def sample(
     ctx: typer.Context,
     source_id: int,
-    payload: str = typer.Option(..., help="JSON payload to POST"),
+    payload: str = typer.Option(..., help="JSON payload to POST; accepts @file.json or @-"),
     dry_run: bool = DRY_RUN_OPT,
 ) -> None:
     """Post a sample payload to a webhook source."""

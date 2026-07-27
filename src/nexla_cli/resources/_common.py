@@ -33,7 +33,10 @@ def not_in_v1(feature: str) -> NoReturn:
 # Body options shared by every create/update command. The precedence is
 # named options > --params > --json (see validate.merge_body).
 JSON_OPT = typer.Option(
-    None, "--json", help="Raw JSON body; merged under named options, over --params"
+    None,
+    "--json",
+    help="Raw JSON body; merged under named options, over --params. "
+    "Accepts @path/to/body.json or @- to read STDIN",
 )
 PARAMS_OPT = typer.Option(
     [], "--params", help="key=value body overrides (repeatable); lowest precedence"

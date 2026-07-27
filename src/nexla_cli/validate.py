@@ -14,6 +14,7 @@ validator it depends on belong in the same module.
 from __future__ import annotations
 
 import json as jsonlib
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,28 @@ def resource_id(raw: str) -> str:
     return raw
 
 
+def read_json_arg(name: str, raw: str) -> str:
+    """Resolve a JSON option's value to literal JSON text, honoring ``@``.
+
+    ``@/path/to/body.json`` reads the file, ``@-`` reads STDIN, anything
+    else is already literal JSON and is returned unchanged. Agents driving
+    the CLI hit argv length limits and shell-quoting hazards passing a
+    non-trivial body inline; the ``@`` prefix is the long-standing curl
+    convention for exactly that. Only the *first* character is special, so
+    a literal JSON body (which always starts with ``{``/``[``/``"``/a
+    digit) can never be mistaken for a file reference.
+    """
+    if not raw.startswith("@"):
+        return raw
+    ref = raw[1:]
+    if ref == "-":
+        return sys.stdin.read()
+    try:
+        return Path(ref).read_text()
+    except OSError as e:
+        raise CliError(EXIT.VALIDATION, f"--{name}: cannot read {ref}: {e.strerror}") from e
+
+
 def parse_json_arg(name: str, raw: str) -> Any:
     """Parse a named JSON CLI option's value, failing cleanly on bad input.
 
@@ -62,9 +85,12 @@ def parse_json_arg(name: str, raw: str) -> Any:
     site through this helper turns that into a clean
     ``EXIT.VALIDATION`` (exit 2) error naming the offending option --
     mirroring how ``build_body`` already handles ``--json``.
+
+    The value is first passed through :func:`read_json_arg`, so every
+    option routed through here accepts ``@file`` / ``@-`` for free.
     """
     try:
-        return jsonlib.loads(raw)
+        return jsonlib.loads(read_json_arg(name, raw))
     except jsonlib.JSONDecodeError as e:
         raise CliError(EXIT.VALIDATION, f"--{name} is not valid JSON: {e}") from e
 
@@ -177,10 +203,9 @@ def build_body(named: dict[str, Any], raw_json: str | None, params: list[str]) -
         key, _, value = p.partition("=")
         body[key] = value
     if raw_json:
-        try:
-            parsed = jsonlib.loads(raw_json)
-        except jsonlib.JSONDecodeError as e:
-            raise CliError(EXIT.VALIDATION, f"--json is not valid JSON: {e}") from e
+        # Via parse_json_arg so `--json @body.json` / `--json @-` work the
+        # same as every other JSON-taking option.
+        parsed = parse_json_arg("json", raw_json)
         if not isinstance(parsed, dict):
             raise CliError(EXIT.VALIDATION, "--json must be a JSON object")
         body.update(parsed)

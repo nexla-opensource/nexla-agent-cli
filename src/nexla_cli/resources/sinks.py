@@ -79,7 +79,9 @@ def create(
     credential_id: int = typer.Option(...),
     connector: str = typer.Option(...),
     endpoint: str | None = typer.Option(None),
-    config: str = typer.Option("{}", help="JSON object of connector-specific fields"),
+    config: str = typer.Option(
+        "{}", help="JSON object of connector-specific fields; accepts @file.json or @-"
+    ),
     json_body: str | None = JSON_OPT,
     params: list[str] = PARAMS_OPT,
     dry_run: bool = DRY_RUN_OPT,
@@ -116,7 +118,7 @@ def update(
     sink_id: int,
     name: str | None = typer.Option(None),
     description: str | None = typer.Option(None),
-    config: str | None = typer.Option(None, help="JSON object"),
+    config: str | None = typer.Option(None, help="JSON object; accepts @file.json or @-"),
     json_body: str | None = JSON_OPT,
     params: list[str] = PARAMS_OPT,
     dry_run: bool = DRY_RUN_OPT,
