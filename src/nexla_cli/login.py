@@ -14,82 +14,147 @@ import contextlib
 import os
 import sys
 import time
+import webbrowser
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import typer
 
-from . import client, config, oauth, output
+from . import client, config, output
 from .errors import EXIT, CliError
 from .sanitize import sanitize
 
+# Statuses the pairing endpoint answers a poll with. Borrowed from RFC 8628's
+# vocabulary -- the express handoff is not a device grant, but a poll loop that
+# reads like every other one is worth more than novelty here.
+_PENDING = "authorization_pending"
+_SLOW_DOWN = "slow_down"
 
-def _oauth_client_id() -> str | None:
-    """The CLI's public OAuth client_id, or None if none is configured.
 
-    Not a secret (PKCE is the proof), but not guessable either, so it has to be
-    supplied until a native app is registered and a default can ship.
+def _browser_login(*, open_browser: bool) -> dict[str, Any]:
+    """Open a pairing, wait for the user to approve it in a browser, return the body.
+
+    The CLI never talks to an identity provider: the express web app already
+    signs users in (Google, Microsoft, email/password, service key) and already
+    holds a Nexla bearer, so this borrows that instead of becoming an OAuth
+    client itself. That means no IdP app registration, and it works for every
+    identity type rather than just one.
+
+    No loopback listener: the CLI polls, which is the one path that works
+    everywhere -- over SSH, in a container, on a laptop. A local redirect would
+    only save the user a glance at the terminal.
+
+    The bare ``verification_uri`` is opened deliberately, *without* the
+    ``user_code`` embedded, so the code has to be typed into the approval page.
+    A pre-filled link is a one-click approval of whatever pairing the link
+    carries, which is exactly the shape a phishing page wants.
     """
-    return os.environ.get("NEXLA_OAUTH_CLIENT_ID") or None
+    paired = _pair()
 
+    typer.echo(f"Approve this CLI at: {paired['verification_uri']}", err=True)
+    typer.echo(f"Pairing code: {paired['user_code']}", err=True)
+    if open_browser and webbrowser.open(paired["verification_uri"]):
+        typer.echo("Opened your browser. Enter the pairing code above.", err=True)
+    else:
+        typer.echo("Open that URL and enter the pairing code above.", err=True)
 
-def _browser_login() -> dict[str, Any]:
-    """Loopback PKCE against the IdP, then exchange the id-token for a bearer.
-
-    Express's ``/auth/microsoft/login`` accepts a bare ``microsoft_id_token``
-    and returns the same ``LoginResponse`` as ``/login``, so the whole
-    persistence path downstream is unchanged.
-    """
-    client_id = _oauth_client_id()
-    if client_id is None:
-        raise CliError(
-            EXIT.CONFIG,
-            "browser sign-in needs an OAuth client id: set NEXLA_OAUTH_CLIENT_ID "
-            "(a registered public/native app), or authenticate with --service-key",
-        )
-    authority = os.environ.get("NEXLA_OAUTH_AUTHORITY") or oauth.DEFAULT_AUTHORITY
-    id_token = oauth.obtain_id_token(client_id, authority=authority)
-    resp = client.request(
-        "POST",
-        "/auth/microsoft/login",
-        json={"microsoft_id_token": id_token},
-        require_auth=False,
+    return _poll_until_approved(
+        poll_token=paired["poll_token"],
+        interval=float(paired["interval"]),
+        expires_in=float(paired["expires_in"]),
     )
-    if not isinstance(resp, dict) or not resp.get("access_token"):
-        raise CliError(EXIT.AUTH, "sign-in succeeded but no access token was returned")
-    return resp
+
+
+def _pair() -> dict[str, Any]:
+    """Start a pairing, translating "this deployment has no handoff" clearly.
+
+    ``/cli-auth/*`` is newer than some deployments; a bare 404 here would read
+    as "not found" and send someone hunting for a missing flow rather than
+    telling them the server simply doesn't offer browser login yet.
+    """
+    try:
+        paired = client.request("POST", "/cli-auth/pair", json={}, require_auth=False)
+    except CliError as e:
+        if e.code == EXIT.NOT_FOUND:
+            raise CliError(
+                EXIT.CONFIG,
+                "browser login isn't available on this deployment "
+                "(no /cli-auth endpoint) -- use `nexla-cli login --service-key <key>`",
+            ) from None
+        raise
+    if not isinstance(paired, dict) or not paired.get("poll_token"):
+        raise CliError(EXIT.UPSTREAM, "pairing response was missing a poll token")
+    return paired
+
+
+def _poll_until_approved(*, poll_token: str, interval: float, expires_in: float) -> dict[str, Any]:
+    """Poll until the pairing is approved, denied, or expires.
+
+    Talks HTTP directly rather than through :func:`client.request`, because here
+    the status code *is* the protocol: 202 and 429 are both "keep going", and
+    ``request`` turns every non-2xx into a raised error.
+    """
+    deadline = time.monotonic() + expires_in
+    body: dict[str, Any] = {}
+
+    with httpx.Client(base_url=client._base(), timeout=client.timeout()) as http:
+        while True:
+            try:
+                resp = http.post("/cli-auth/poll", json={"poll_token": poll_token})
+            except httpx.HTTPError as e:
+                raise CliError(EXIT.UPSTREAM, f"request failed: {e}") from e
+
+            if resp.status_code == 200:
+                collected: dict[str, Any] = resp.json()
+                return collected
+
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            status = body.get("status")
+
+            if status == _SLOW_DOWN:
+                # The server thinks we're polling faster than agreed. Back off
+                # rather than burning the pairing's attempt budget.
+                interval += 1
+            elif status != _PENDING:
+                raise CliError(EXIT.from_status(resp.status_code), _explain(status))
+
+            if time.monotonic() >= deadline:
+                raise CliError(EXIT.ERROR, "the pairing code expired before it was approved")
+            time.sleep(interval)
+
+
+def _explain(status: str | None) -> str:
+    return {
+        "access_denied": "the request was denied in the browser",
+        "expired_token": "the pairing code expired or was already used",
+        "bearer_unavailable": (
+            "approved, but the server could not release a session -- sign in to the web app "
+            "again and re-run this command"
+        ),
+    }.get(status or "", f"pairing failed ({status or 'unknown status'})")
 
 
 def _select_auth_method() -> bool:
     """gh-style menu: pick an auth method. Returns True for browser sign-in.
 
-    Browser sign-in is only offered when a public ``client_id`` is configured
-    (``NEXLA_OAUTH_CLIENT_ID``); until a native app is registered there is
-    nothing to authorize against, so the option is shown as unavailable rather
-    than failing after the fact. All prompts go to stderr so stdout stays
-    token-only for ``export NEXLA_TOKEN=$(nexla-cli login)``.
+    Browser sign-in needs no client-side configuration -- it goes through the
+    express web app's existing login -- so unlike the old IdP-based flow it is
+    always offered. All prompts go to stderr so stdout stays token-only for
+    ``export NEXLA_TOKEN=$(nexla-cli login)``.
     """
-    browser_ready = _oauth_client_id() is not None
     while True:
         typer.echo("How would you like to authenticate nexla-cli?", err=True)
         typer.echo("  1. Paste a service key", err=True)
-        typer.echo(
-            "  2. Log in with a browser"
-            + ("" if browser_ready else " [unavailable: NEXLA_OAUTH_CLIENT_ID not set]"),
-            err=True,
-        )
+        typer.echo("  2. Log in with a browser", err=True)
         choice = typer.prompt("Choose", default="1", err=True).strip().lower()
         if choice in ("1", "service key", "key", "paste"):
             return False
         if choice in ("2", "browser", "oauth", "sso"):
-            if browser_ready:
-                return True
-            typer.echo(
-                "Browser sign-in needs a registered OAuth client: set "
-                "NEXLA_OAUTH_CLIENT_ID (or use a service key).",
-                err=True,
-            )
-            continue
+            return True
         typer.echo(f"invalid choice: {choice!r}", err=True)
 
 
@@ -222,7 +287,12 @@ def login(
     browser: bool = typer.Option(
         False,
         "--browser",
-        help="Sign in through the browser (OAuth loopback PKCE) instead of a service key",
+        help="Authenticate in the browser instead of with a service key",
+    ),
+    open_browser: bool = typer.Option(
+        True,
+        "--open/--no-open",
+        help="Open the approval page automatically; --no-open just prints it (headless)",
     ),
     no_store: bool = typer.Option(
         False,
@@ -240,12 +310,17 @@ def login(
     if api_url:
         os.environ["NEXLA_API_URL"] = api_url
 
+    if browser and service_key is not None:
+        # Both given is ambiguous -- say so rather than silently ignoring one.
+        # (Neither is fine: that's the interactive menu.)
+        raise CliError(EXIT.VALIDATION, "pass either --service-key or --browser, not both")
+
     if service_key is None and not browser:
         service_key = _obtain_service_key()
         browser = service_key is None  # menu picked browser sign-in
 
     if browser:
-        resp = _browser_login()
+        resp = _browser_login(open_browser=open_browser)
     else:
         resp = client.request(
             "POST", "/login", json={"service_key": service_key}, require_auth=False

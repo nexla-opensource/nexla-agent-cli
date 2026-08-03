@@ -245,14 +245,14 @@ def test_select_auth_method_paste_returns(monkeypatch) -> None:
     assert login_module._select_auth_method() is False
 
 
-def test_select_auth_method_browser_loops_until_available(monkeypatch, capsys) -> None:
-    # "2" (browser) is not available yet -> message + re-prompt until "1".
+def test_select_auth_method_browser_is_always_offered(monkeypatch) -> None:
+    # Browser sign-in goes through the express web app's existing login, so it
+    # needs no client-side config and is always selectable -- unlike the old
+    # IdP flow, which was gated on a client_id nobody had registered.
     from nexla_cli import login as login_module
 
-    choices = iter(["2", "1"])
-    monkeypatch.setattr(login_module.typer, "prompt", lambda *a, **k: next(choices))
-    login_module._select_auth_method()  # must not raise; loops past "2"
-    assert "available" in capsys.readouterr().err.lower()
+    monkeypatch.setattr(login_module.typer, "prompt", lambda *a, **k: "2")
+    assert login_module._select_auth_method() is True
 
 
 def test_obtain_service_key_tty_shows_menu(monkeypatch) -> None:

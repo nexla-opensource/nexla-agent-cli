@@ -66,8 +66,23 @@ Any signed-in user can mint one — including SSO (Google / Microsoft) users:
 open the Nexla web app, go to your **profile → API key**, and create one. The
 full key is shown once, at creation time, so copy it then.
 
-There is no separate browser sign-in for the CLI, and none is needed: the key
-is the credential, and you only paste it once per machine.
+### Browser login
+
+On deployments that expose the CLI-auth handoff, you can skip the key entirely:
+
+```bash
+nexla-cli login --browser        # add --no-open on a headless box
+```
+
+The CLI prints a pairing code, you approve it in the browser (using whatever
+login you already use -- Google, Microsoft, email/password), and the CLI
+collects the session. It works over SSH because it polls rather than listening
+on a local port, and the code has to be typed into the approval page: the URL
+the CLI opens deliberately does *not* embed it, since a pre-filled link is a
+one-click approval of whatever pairing it carries.
+
+If the deployment doesn't offer it, `--browser` says so and points you at
+`--service-key`.
 
 ### Scripting and CI
 
