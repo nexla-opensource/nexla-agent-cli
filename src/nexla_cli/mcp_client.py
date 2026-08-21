@@ -18,16 +18,22 @@ from typing import Any
 import httpx
 import typer
 
-from . import client, dryrun
+from . import client, config, dryrun
 from .errors import EXIT, CliError
 
 _HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 
 
 def _base() -> str:
-    url = os.environ.get("NEXLA_MONITORING_URL")
+    # Precedence mirrors client._base: NEXLA_MONITORING_URL env > stored config
+    # (from `login --monitoring-url`). Not inferred from the API URL (different host).
+    url = os.environ.get("NEXLA_MONITORING_URL") or config.load().get("monitoring_url")
     if not url:
-        raise CliError(EXIT.CONFIG, "NEXLA_MONITORING_URL is not set")
+        raise CliError(
+            EXIT.CONFIG,
+            "no monitoring URL: set NEXLA_MONITORING_URL or run "
+            "`nexla-cli login --monitoring-url ...`",
+        )
     return url
 
 

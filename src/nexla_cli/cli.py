@@ -160,6 +160,14 @@ def _wrap_cli_error[F: Callable[..., Any]](fn: F) -> F:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return fn(*args, **kwargs)
+        except (KeyboardInterrupt, typer.Abort):
+            # Ctrl-C (or EOF) at any prompt is a deliberate user action, not a
+            # crash -- exit quietly instead of dumping a traceback. 130 is the
+            # shell convention for SIGINT (128 + 2) and stays clear of the 0-6
+            # taxonomy, so an agent can still tell "user aborted" apart from a
+            # real failure.
+            typer.echo("aborted", err=True)
+            raise typer.Exit(130) from None
         except CliError as e:
             # Resolving the mode can itself raise CliError (an invalid
             # `-o xml`), and we're already handling one — fall back to the
@@ -238,6 +246,8 @@ def _root(
 
 
 app.command("login")(_wrap_cli_error(login_module.login))
+app.command("logout")(_wrap_cli_error(login_module.logout))
+app.command("whoami")(_wrap_cli_error(login_module.whoami))
 
 for _mod in (
     sources,
