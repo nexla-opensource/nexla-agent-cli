@@ -49,16 +49,62 @@ uv tool install "git+https://github.com/nexla-opensource/nexla-agent-cli.git"
 ## Quick start
 
 ```bash
-export NEXLA_API_URL=https://<your-deployed-api>
-export NEXLA_TOKEN=$(nexla-cli login --service-key <your-service-key>)
+nexla-cli login --api-url https://<your-deployed-api>
 nexla-cli sources list
 ```
 
-`nexla-cli login` prints a bearer token to stdout (see command substitution
-above); alternatively, set the following environment variables directly:
+`login` stores the session in `$XDG_CONFIG_HOME/nexla/config.json`
+(`~/.config/nexla/config.json` by default, mode `0600`), so later commands
+need no environment variables. Run it with no `--service-key` and it prompts
+for one without echoing it. The stored bearer is refreshed automatically
+before it expires; `nexla-cli whoami` shows the current session and
+`nexla-cli logout` clears it.
+
+### Where do I get a service key?
+
+Any signed-in user can mint one — including SSO (Google / Microsoft) users:
+open the Nexla web app, go to your **profile → API key**, and create one. The
+full key is shown once, at creation time, so copy it then.
+
+### Browser login
+
+On deployments that expose the CLI-auth handoff, you can skip the key entirely:
+
+```bash
+export NEXLA_WEB_URL=https://<your-deployed-web-app>
+nexla-cli login --browser        # --no-open just prints the URL
+```
+
+The CLI opens an approval page in the browser, you approve it with whatever
+login you already use (Google, Microsoft, email/password, service key), and
+the session lands straight back in the terminal. Nothing to copy or type.
+
+Under the hood it's a PKCE authorization code (RFC 7636) over a loopback
+redirect: the CLI listens on a random local port, the approval mints a
+single-use 60-second code bound to your session, and redeeming it requires a
+verifier that never leaves the CLI process -- so the code alone, seen in
+browser history or a proxy log, is useless.
+
+That means it needs a browser **on the same machine**. Over SSH or in a
+container, use `--service-key`. If the deployment doesn't offer the handoff at
+all, `--browser` says so and points you at `--service-key`.
+
+### Scripting and CI
+
+`login` prints the bearer to stdout **only when stdout is not a terminal**, so
+the capture idiom still works unchanged, and interactive use doesn't leave a
+live token in your scrollback:
+
+```bash
+export NEXLA_TOKEN=$(nexla-cli login --service-key <your-service-key>)
+```
+
+Or set the environment variables directly — they always take precedence over
+the stored config:
 
 - `NEXLA_API_URL` — base URL of the deployed Nexla agent API
 - `NEXLA_TOKEN` — bearer token to authenticate requests
+- `NEXLA_WEB_URL` — base URL of the web app, used only by `login --browser`
 
 ## Using this CLI from Claude Code
 
@@ -137,7 +183,9 @@ nexla-cli <resource> --help
 
 | Resource | Commands |
 |----------|----------|
-| `login` | `login --service-key <key> [--api-url <url>]` — exchanges a service key for a bearer token, printed to stdout |
+| `login` | `login [--service-key <key>] [--api-url <url>] [--monitoring-url <url>]` — exchanges a service key for a bearer, stores the session (prompts for the key if omitted; prints the token only when stdout is captured) |
+| `logout` | clears the stored session (and invalidates the bearer server-side) |
+| `whoami` | shows the current identity, where the CLI is pointed, and the token source |
 | `schema` | `schema [<resource>.<verb>]` — machine-readable JSON signature of one command or the whole `/nexla/*` surface, fetched live from the deployed API's OpenAPI doc |
 | `sources` | `list`, `get`, `create`, `update`, `activate`, `pause`, `delete`, `sample`, `file-upload` |
 | `sinks` | `list`, `get`, `create`, `update`, `activate`, `pause`, `delete` |

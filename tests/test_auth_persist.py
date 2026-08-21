@@ -241,17 +241,18 @@ def test_select_auth_method_paste_returns(monkeypatch) -> None:
     from nexla_cli import login as login_module
 
     monkeypatch.setattr(login_module.typer, "prompt", lambda *a, **k: "1")
-    assert login_module._select_auth_method() is None
+    # False = "use a service key" (True would mean browser sign-in).
+    assert login_module._select_auth_method() is False
 
 
-def test_select_auth_method_browser_loops_until_available(monkeypatch, capsys) -> None:
-    # "2" (browser) is not available yet -> message + re-prompt until "1".
+def test_select_auth_method_browser_is_always_offered(monkeypatch) -> None:
+    # Browser sign-in goes through the express web app's existing login, so it
+    # needs no client-side config and is always selectable -- unlike the old
+    # IdP flow, which was gated on a client_id nobody had registered.
     from nexla_cli import login as login_module
 
-    choices = iter(["2", "1"])
-    monkeypatch.setattr(login_module.typer, "prompt", lambda *a, **k: next(choices))
-    login_module._select_auth_method()  # must not raise; loops past "2"
-    assert "available" in capsys.readouterr().err.lower()
+    monkeypatch.setattr(login_module.typer, "prompt", lambda *a, **k: "2")
+    assert login_module._select_auth_method() is True
 
 
 def test_obtain_service_key_tty_shows_menu(monkeypatch) -> None:
@@ -364,3 +365,60 @@ def test_env_token_401_never_rewrites_stored_config(
     assert result.exit_code == EXIT.AUTH
     assert not login.called  # no re-mint from the env session
     assert config.load()["access_token"] == "cfg-tok"  # store untouched
+
+
+def test_captured_stdout_still_prints_raw_token(
+    cli_app, respx_mock: respx.MockRouter, monkeypatch
+) -> None:
+    # THE contract: `export NEXLA_TOKEN=$(nexla-cli login ...)`. Command
+    # substitution gives a pipe, so stdout is not a tty -> raw token only.
+    _no_env(monkeypatch)
+    respx_mock.post(f"{BASE_URL}/login").mock(return_value=httpx.Response(200, json=_LOGIN_BODY))
+    result = CliRunner().invoke(
+        cli_app, ["login", "--service-key", "k", "--api-url", BASE_URL]
+    )
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "fresh-tok"
+
+
+def test_interactive_terminal_hides_the_token(
+    cli_app, respx_mock: respx.MockRouter, monkeypatch
+) -> None:
+    # On a real terminal, printing a live JWT just parks a secret in the
+    # scrollback -- it was persisted anyway. Show a summary instead.
+    _no_env(monkeypatch)
+    monkeypatch.setattr("nexla_cli.login._stdout_is_tty", lambda: True)
+    respx_mock.post(f"{BASE_URL}/login").mock(return_value=httpx.Response(200, json=_LOGIN_BODY))
+    result = CliRunner().invoke(
+        cli_app, ["login", "--service-key", "k", "--api-url", BASE_URL]
+    )
+    assert result.exit_code == 0
+    assert "fresh-tok" not in result.output
+    assert "Logged in as a@nexla.com (Acme)" in result.output
+    assert "expires" in result.output
+
+
+def test_no_store_prints_token_even_on_a_terminal(
+    cli_app, respx_mock: respx.MockRouter, monkeypatch
+) -> None:
+    # With --no-store nothing is persisted, so the token IS the deliverable.
+    _no_env(monkeypatch)
+    monkeypatch.setattr("nexla_cli.login._stdout_is_tty", lambda: True)
+    respx_mock.post(f"{BASE_URL}/login").mock(return_value=httpx.Response(200, json=_LOGIN_BODY))
+    result = CliRunner().invoke(
+        cli_app, ["login", "--service-key", "k", "--api-url", BASE_URL, "--no-store"]
+    )
+    assert result.exit_code == 0
+    assert "fresh-tok" in result.stdout
+
+
+def test_expiry_phrase_is_human_readable() -> None:
+    import time as _t
+
+    from nexla_cli import login as login_module
+
+    assert "in 2d" in login_module._expiry_phrase(int(_t.time()) + 2 * 86400 + 60)
+    assert "expired" in login_module._expiry_phrase(int(_t.time()) - 5)
+    assert "UTC" in login_module._expiry_phrase(int(_t.time()) + 100)
+    # Non-timestamps degrade instead of raising.
+    assert login_module._expiry_phrase(None) == "None"
