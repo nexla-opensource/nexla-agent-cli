@@ -1,7 +1,8 @@
 """`nexla-cli login` / `logout` -- session bearer lifecycle.
 
-`login` exchanges a Nexla service key for a bearer (bare ``POST /login``, no
-``/nexla`` prefix -- matches ``routers/auth.py``). By default it also stashes
+`login` gets a bearer from a service key or a browser approval (bare
+``POST /login`` / ``POST /cli-auth/token``, no ``/nexla`` prefix -- matches
+``routers/auth.py`` and ``routers/cli_auth.py``). By default it also stashes
 the service key + bearer in the config file (see ``config.py``) so subsequent
 commands authenticate with no ``export NEXLA_TOKEN=$(...)`` step, and so an
 expired bearer can be transparently re-minted on a 401 (``client._reauth``).
@@ -10,71 +11,149 @@ expired bearer can be transparently re-minted on a 401 (``client._reauth``).
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import hashlib
 import os
+import secrets
 import sys
 import time
 import webbrowser
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
-import httpx
 import typer
 
 from . import client, config, output
 from .errors import EXIT, CliError
 from .sanitize import sanitize
 
-# Statuses the pairing endpoint answers a poll with. Borrowed from RFC 8628's
-# vocabulary -- the express handoff is not a device grant, but a poll loop that
-# reads like every other one is worth more than novelty here.
-_PENDING = "authorization_pending"
-_SLOW_DOWN = "slow_down"
+# How long to wait for the browser to redirect back to the loopback listener.
+# Has to cover the full sign-in interaction if the user isn't already logged
+# in to the web app -- an OAuth provider's account picker + consent screen can
+# easily take a few minutes, not just "clicked a button." A passive listener
+# costs nothing while it waits, so match the old device-flow design's 10
+# minute budget rather than optimizing this down.
+_CALLBACK_TIMEOUT_S = 600.0
+
+
+def _web_base() -> str:
+    """Base URL of the express web app, where the approval page lives.
+
+    Separate from ``NEXLA_API_URL``: the approval page is served by the web
+    app, the token exchange by the API, and the two are different origins in
+    every deployment.
+    """
+    url = os.environ.get("NEXLA_WEB_URL")
+    if not url:
+        raise CliError(
+            EXIT.CONFIG,
+            "NEXLA_WEB_URL is not set -- browser login needs the web app's URL "
+            "(or use `nexla-cli login --service-key <key>`)",
+        )
+    url = url.rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        # A schemeless value (e.g. "localhost:3000") makes webbrowser.open()
+        # misbehave in confusing, platform-specific ways instead of just
+        # failing here with a clear, actionable message.
+        raise CliError(
+            EXIT.CONFIG,
+            f"NEXLA_WEB_URL must start with http:// or https://, got {url!r}",
+        )
+    return url
+
+
+def _pkce_challenge(verifier: str) -> str:
+    """RFC 7636 S256: base64url(sha256(verifier)), unpadded (exactly 43 chars)."""
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
 def _browser_login(*, open_browser: bool) -> dict[str, Any]:
-    """Open a pairing, wait for the user to approve it in a browser, return the body.
+    """PKCE authorization-code flow over a loopback redirect.
 
     The CLI never talks to an identity provider: the express web app already
-    signs users in (Google, Microsoft, email/password, service key) and already
-    holds a Nexla bearer, so this borrows that instead of becoming an OAuth
-    client itself. That means no IdP app registration, and it works for every
-    identity type rather than just one.
+    signs users in (Google, Microsoft, email/password, service key) and
+    already holds a Nexla bearer, so this borrows that instead of becoming an
+    OAuth client itself. That means no IdP app registration, and it works for
+    every identity type rather than just one.
 
-    No loopback listener: the CLI polls, which is the one path that works
-    everywhere -- over SSH, in a container, on a laptop. A local redirect would
-    only save the user a glance at the terminal.
+    Mechanically: bind a local loopback port, send the user to an
+    *authenticated* approval page carrying that port, a PKCE challenge, and a
+    ``state`` value we made up. Approving mints a single-use, short-lived code
+    bound to the exact approved bearer and redirects straight back here; we
+    then exchange the code plus the verifier -- which never left this process
+    -- for the session. A code observed in transit (browser history, a proxy
+    log) is useless without the verifier.
 
-    The bare ``verification_uri`` is opened deliberately, *without* the
-    ``user_code`` embedded, so the code has to be typed into the approval page.
-    A pre-filled link is a one-click approval of whatever pairing the link
-    carries, which is exactly the shape a phishing page wants.
+    Same-machine only, on purpose: approval happens in a browser on the host
+    running the CLI, so the redirect target can be 127.0.0.1. An earlier
+    design polled instead, to also cover SSH/headless use -- but
+    ``--service-key`` already covers that case, so this flow doesn't try to.
     """
-    paired = _pair()
+    code_verifier = secrets.token_urlsafe(32)  # 43 chars, RFC 7636 minimum
+    code_challenge = _pkce_challenge(code_verifier)
+    state = secrets.token_urlsafe(16)
 
-    typer.echo(f"Approve this CLI at: {paired['verification_uri']}", err=True)
-    typer.echo(f"Pairing code: {paired['user_code']}", err=True)
-    if open_browser and webbrowser.open(paired["verification_uri"]):
-        typer.echo("Opened your browser. Enter the pairing code above.", err=True)
+    # Port 0 -> the OS picks a free ephemeral port. Bind before opening the
+    # browser: the port has to be in the URL we hand it.
+    server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+    port = server.server_address[1]
+
+    approve_url = f"{_web_base()}/cli-auth?port={port}&challenge={code_challenge}&state={state}"
+    typer.echo(f"Approve this CLI at: {approve_url}", err=True)
+    if open_browser and webbrowser.open(approve_url):
+        typer.echo("Opened your browser. Waiting for approval...", err=True)
     else:
-        typer.echo("Open that URL and enter the pairing code above.", err=True)
+        typer.echo("Open that URL to continue. Waiting for approval...", err=True)
 
-    return _poll_until_approved(
-        poll_token=paired["poll_token"],
-        interval=float(paired["interval"]),
-        expires_in=float(paired["expires_in"]),
-    )
+    deadline = time.monotonic() + _CALLBACK_TIMEOUT_S
+    try:
+        # Loop rather than a single handle_request(): anything else that hits
+        # the ephemeral port first (a browser preflight, a port scan) gets
+        # served and discarded without ending the wait.
+        while getattr(server, "nexla_result", None) is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            server.timeout = remaining
+            server.handle_request()
+    finally:
+        server.server_close()
+
+    result: dict[str, str] | None = getattr(server, "nexla_result", None)
+    if result is None:
+        raise CliError(EXIT.ERROR, "timed out waiting for the browser to approve")
+    if result.get("state") != state:
+        # Check state before anything else in the callback is trusted.
+        raise CliError(
+            EXIT.ERROR, "callback state mismatch -- possible cross-site request, aborting"
+        )
+    if "error" in result:
+        raise CliError(EXIT.AUTH, "the request was denied in the browser")
+    code = result.get("code")
+    if not code:
+        raise CliError(EXIT.ERROR, "callback carried no authorization code")
+
+    return _redeem(code=code, code_verifier=code_verifier)
 
 
-def _pair() -> dict[str, Any]:
-    """Start a pairing, translating "this deployment has no handoff" clearly.
+def _redeem(*, code: str, code_verifier: str) -> dict[str, Any]:
+    """Exchange the code + PKCE verifier for a session.
 
     ``/cli-auth/*`` is newer than some deployments; a bare 404 here would read
     as "not found" and send someone hunting for a missing flow rather than
     telling them the server simply doesn't offer browser login yet.
     """
     try:
-        paired = client.request("POST", "/cli-auth/pair", json={}, require_auth=False)
+        resp: dict[str, Any] = client.request(
+            "POST",
+            "/cli-auth/token",
+            json={"code": code, "code_verifier": code_verifier},
+            require_auth=False,
+        )
     except CliError as e:
         if e.code == EXIT.NOT_FOUND:
             raise CliError(
@@ -83,59 +162,40 @@ def _pair() -> dict[str, Any]:
                 "(no /cli-auth endpoint) -- use `nexla-cli login --service-key <key>`",
             ) from None
         raise
-    if not isinstance(paired, dict) or not paired.get("poll_token"):
-        raise CliError(EXIT.UPSTREAM, "pairing response was missing a poll token")
-    return paired
+    return resp
 
 
-def _poll_until_approved(*, poll_token: str, interval: float, expires_in: float) -> dict[str, Any]:
-    """Poll until the pairing is approved, denied, or expires.
+class _CallbackHandler(BaseHTTPRequestHandler):
+    """One-shot local listener for the loopback redirect.
 
-    Talks HTTP directly rather than through :func:`client.request`, because here
-    the status code *is* the protocol: 202 and 429 are both "keep going", and
-    ``request`` turns every non-2xx into a raised error.
+    Stashes the parsed query params of a ``/callback`` request on the server
+    instance, then hands back a small human-readable page. Anything else gets
+    a 404 and is ignored, so a stray request can't be mistaken for the real
+    callback. Never writes to stdout/stderr -- only ``login()``'s own messages
+    do, so machine consumers of the CLI's stdout stay clean.
     """
-    deadline = time.monotonic() + expires_in
-    body: dict[str, Any] = {}
 
-    with httpx.Client(base_url=client._base(), timeout=client.timeout()) as http:
-        while True:
-            try:
-                resp = http.post("/cli-auth/poll", json={"poll_token": poll_token})
-            except httpx.HTTPError as e:
-                raise CliError(EXIT.UPSTREAM, f"request failed: {e}") from e
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        pass  # silence BaseHTTPRequestHandler's default stderr access log
 
-            if resp.status_code == 200:
-                collected: dict[str, Any] = resp.json()
-                return collected
+    def do_GET(self) -> None:  # noqa: N802 - name required by BaseHTTPRequestHandler
+        parsed = urlparse(self.path)
+        if parsed.path != "/callback":
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not found")
+            return
 
-            try:
-                body = resp.json()
-            except ValueError:
-                body = {}
-            status = body.get("status")
+        query = parse_qs(parsed.query)
+        self.server.nexla_result = {k: v[0] for k, v in query.items()}  # type: ignore[attr-defined]
 
-            if status == _SLOW_DOWN:
-                # The server thinks we're polling faster than agreed. Back off
-                # rather than burning the pairing's attempt budget.
-                interval += 1
-            elif status != _PENDING:
-                raise CliError(EXIT.from_status(resp.status_code), _explain(status))
-
-            if time.monotonic() >= deadline:
-                raise CliError(EXIT.ERROR, "the pairing code expired before it was approved")
-            time.sleep(interval)
-
-
-def _explain(status: str | None) -> str:
-    return {
-        "access_denied": "the request was denied in the browser",
-        "expired_token": "the pairing code expired or was already used",
-        "bearer_unavailable": (
-            "approved, but the server could not release a session -- sign in to the web app "
-            "again and re-run this command"
-        ),
-    }.get(status or "", f"pairing failed ({status or 'unknown status'})")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(
+            b"<html><body><p>Signed in. You can close this tab and "
+            b"return to your terminal.</p></body></html>"
+        )
 
 
 def _select_auth_method() -> bool:
@@ -143,7 +203,8 @@ def _select_auth_method() -> bool:
 
     Browser sign-in needs no client-side configuration -- it goes through the
     express web app's existing login -- so unlike the old IdP-based flow it is
-    always offered. All prompts go to stderr so stdout stays token-only for
+    always offered. It does need a browser on this machine (the approval
+    redirects to a loopback port); over SSH, use --service-key. All prompts go to stderr so stdout stays token-only for
     ``export NEXLA_TOKEN=$(nexla-cli login)``.
     """
     while True:
@@ -292,7 +353,7 @@ def login(
     open_browser: bool = typer.Option(
         True,
         "--open/--no-open",
-        help="Open the approval page automatically; --no-open just prints it (headless)",
+        help="Open the approval page automatically; --no-open just prints the URL",
     ),
     no_store: bool = typer.Option(
         False,

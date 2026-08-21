@@ -71,18 +71,23 @@ full key is shown once, at creation time, so copy it then.
 On deployments that expose the CLI-auth handoff, you can skip the key entirely:
 
 ```bash
-nexla-cli login --browser        # add --no-open on a headless box
+export NEXLA_WEB_URL=https://<your-deployed-web-app>
+nexla-cli login --browser        # --no-open just prints the URL
 ```
 
-The CLI prints a pairing code, you approve it in the browser (using whatever
-login you already use -- Google, Microsoft, email/password), and the CLI
-collects the session. It works over SSH because it polls rather than listening
-on a local port, and the code has to be typed into the approval page: the URL
-the CLI opens deliberately does *not* embed it, since a pre-filled link is a
-one-click approval of whatever pairing it carries.
+The CLI opens an approval page in the browser, you approve it with whatever
+login you already use (Google, Microsoft, email/password, service key), and
+the session lands straight back in the terminal. Nothing to copy or type.
 
-If the deployment doesn't offer it, `--browser` says so and points you at
-`--service-key`.
+Under the hood it's a PKCE authorization code (RFC 7636) over a loopback
+redirect: the CLI listens on a random local port, the approval mints a
+single-use 60-second code bound to your session, and redeeming it requires a
+verifier that never leaves the CLI process -- so the code alone, seen in
+browser history or a proxy log, is useless.
+
+That means it needs a browser **on the same machine**. Over SSH or in a
+container, use `--service-key`. If the deployment doesn't offer the handoff at
+all, `--browser` says so and points you at `--service-key`.
 
 ### Scripting and CI
 
@@ -99,6 +104,7 @@ the stored config:
 
 - `NEXLA_API_URL` — base URL of the deployed Nexla agent API
 - `NEXLA_TOKEN` — bearer token to authenticate requests
+- `NEXLA_WEB_URL` — base URL of the web app, used only by `login --browser`
 
 ## Using this CLI from Claude Code
 
